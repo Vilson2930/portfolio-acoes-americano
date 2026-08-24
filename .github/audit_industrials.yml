@@ -1,6 +1,6 @@
-name: Audit Industrials Cell 41 
+name: Audit Industrials Cell 41
 
-on: 
+on:
   workflow_dispatch:
 
 jobs:
