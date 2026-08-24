@@ -588,11 +588,25 @@ def _latest_metric(
     if temp.empty:
         return None
 
+    if "priority" not in temp.columns:
+        temp["priority"] = 0
+
+    temp["priority"] = pd.to_numeric(
+        temp["priority"],
+        errors="coerce",
+    ).fillna(999999)
+
     temp = temp.sort_values(
         [
             "end",
             "available_date",
-        ]
+            "priority",
+        ],
+        ascending=[
+            True,
+            True,
+            False,
+        ],
     )
 
     return temp.iloc[-1]
