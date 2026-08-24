@@ -559,17 +559,12 @@ def run_regression_test():
         f"{len(errors)}"
     )
 
-    if errors:
+    if isinstance(errors, pd.DataFrame) and not errors.empty:
 
         print(
             errors.to_string(
                 index=False
             )
-            if isinstance(
-                errors,
-                pd.DataFrame,
-            )
-            else errors
         )
 
     if fundamentals.empty:
