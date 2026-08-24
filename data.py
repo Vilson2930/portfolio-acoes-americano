@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 import os
 import time
 from pathlib import Path
@@ -224,10 +225,37 @@ def get_sp500_universe(
         "Baixando universo atual do S&P 500..."
     )
 
-    # Leitura direta da página.
-    # Evita passar response.text bruto ao pandas.
-    tables = pd.read_html(
+    # ------------------------------------------------------------------
+    # Download com requests + User-Agent
+    # ------------------------------------------------------------------
+
+    response = requests.get(
         SP500_URL,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept-Language":
+                "en-US,en;q=0.9",
+            "Accept":
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    # ------------------------------------------------------------------
+    # IMPORTANTE:
+    # StringIO transforma o HTML em stream de texto.
+    # Assim o pandas NÃO tenta interpretar o HTML como caminho/URL.
+    # ------------------------------------------------------------------
+
+    tables = pd.read_html(
+        StringIO(
+            response.text
+        ),
         attrs={
             "id": "constituents"
         },
