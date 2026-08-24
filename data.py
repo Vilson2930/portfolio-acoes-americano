@@ -609,7 +609,20 @@ def download_prices(
     tickers: Iterable[str],
     start: str = "2014-01-01",
     end: Optional[str] = None,
+    retries: int = 3,
 ) -> pd.DataFrame:
+    """
+    Download robusto de preços.
+
+    Correção importante para GitHub Actions:
+      • evita concorrência interna do yfinance (threads=False);
+      • detecta ticker ausente ou totalmente NaN;
+      • repete individualmente os tickers que falharam;
+      • reduz o risco de OperationalError('database is locked');
+      • só devolve sucesso quando todos os tickers possuem dados.
+
+    A lógica financeira NÃO é alterada.
+    """
 
     tickers = sorted(
         {
@@ -620,106 +633,260 @@ def download_prices(
     )
 
     if not tickers:
-
         raise ValueError(
             "Nenhum ticker recebido para download."
         )
 
-    raw = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        actions=False,
-        progress=False,
-        threads=True,
-        group_by="column",
-    )
+    def _extract_close(
+        raw: pd.DataFrame,
+        requested: list[str],
+    ) -> pd.DataFrame:
 
-    if raw.empty:
+        if raw is None or raw.empty:
+            return pd.DataFrame()
 
-        raise RuntimeError(
-            "Download de preços retornou vazio."
-        )
-
-    if isinstance(
-        raw.columns,
-        pd.MultiIndex,
-    ):
-
-        if (
-            "Close"
-            not in
-            raw.columns.get_level_values(
-                0
-            )
+        if isinstance(
+            raw.columns,
+            pd.MultiIndex,
         ):
 
-            raise RuntimeError(
-                "Coluna Close não encontrada."
-            )
-
-        close = (
-            raw[
+            if (
                 "Close"
-            ]
-            .copy()
-        )
+                not in
+                raw.columns.get_level_values(0)
+            ):
+                return pd.DataFrame()
 
-    else:
+            close = raw["Close"].copy()
 
-        if "Close" not in raw.columns:
+        else:
 
-            raise RuntimeError(
-                "Coluna Close não encontrada."
+            if "Close" not in raw.columns:
+                return pd.DataFrame()
+
+            close = raw[["Close"]].copy()
+
+            if len(requested) == 1:
+                close.columns = requested
+
+        if isinstance(close, pd.Series):
+            close = close.to_frame(
+                name=requested[0]
             )
 
-        close = (
-            raw[
+        close.columns = [
+            normalize_ticker(c)
+            for c in close.columns
+        ]
+
+        close.index = pd.to_datetime(
+            close.index
+        )
+
+        try:
+            close.index = (
+                close.index
+                .tz_localize(None)
+            )
+        except Exception:
+            pass
+
+        return (
+            close
+            .sort_index()
+            .replace(
                 [
-                    "Close"
-                ]
-            ]
-            .copy()
+                    np.inf,
+                    -np.inf,
+                ],
+                np.nan,
+            )
         )
 
-        if len(tickers) == 1:
+    # ------------------------------------------------------------------
+    # 1. DOWNLOAD EM LOTE — SEM THREADS
+    # ------------------------------------------------------------------
 
-            close.columns = (
-                tickers
-            )
+    last_error = None
+    close = pd.DataFrame()
 
-    if isinstance(
-        close,
-        pd.Series,
+    for attempt in range(
+        1,
+        retries + 1,
     ):
 
-        close = (
-            close.to_frame(
-                name=tickers[0]
+        try:
+
+            raw = yf.download(
+                tickers=tickers,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                actions=False,
+                progress=False,
+                threads=False,
+                group_by="column",
             )
+
+            close = _extract_close(
+                raw,
+                tickers,
+            )
+
+            if not close.empty:
+                break
+
+        except Exception as exc:
+            last_error = exc
+
+        time.sleep(
+            1.5 * attempt
         )
 
-    close.columns = [
-        normalize_ticker(c)
-        for c in close.columns
+    # ------------------------------------------------------------------
+    # 2. IDENTIFICAR TICKERS AUSENTES / VAZIOS
+    # ------------------------------------------------------------------
+
+    missing = []
+
+    for ticker in tickers:
+
+        if (
+            ticker not in close.columns
+            or
+            close[ticker].dropna().empty
+        ):
+            missing.append(
+                ticker
+            )
+
+    # ------------------------------------------------------------------
+    # 3. RETRY INDIVIDUAL
+    # ------------------------------------------------------------------
+
+    recovered = []
+
+    for ticker in missing:
+
+        ticker_close = pd.DataFrame()
+        ticker_error = None
+
+        for attempt in range(
+            1,
+            retries + 2,
+        ):
+
+            try:
+
+                raw_single = yf.download(
+                    tickers=ticker,
+                    start=start,
+                    end=end,
+                    auto_adjust=True,
+                    actions=False,
+                    progress=False,
+                    threads=False,
+                    group_by="column",
+                )
+
+                ticker_close = _extract_close(
+                    raw_single,
+                    [ticker],
+                )
+
+                if (
+                    not ticker_close.empty
+                    and
+                    ticker in ticker_close.columns
+                    and
+                    not ticker_close[ticker].dropna().empty
+                ):
+                    break
+
+            except Exception as exc:
+                ticker_error = exc
+
+            # Pequena espera também reduz disputa pelo banco interno
+            # de cookies/cache do yfinance.
+            time.sleep(
+                1.5 * attempt
+            )
+
+        if (
+            not ticker_close.empty
+            and
+            ticker in ticker_close.columns
+            and
+            not ticker_close[ticker].dropna().empty
+        ):
+
+            recovered.append(
+                ticker_close[[ticker]]
+            )
+
+        else:
+
+            print(
+                f"AVISO — preço não recuperado: "
+                f"{ticker} | {ticker_error}"
+            )
+
+    # ------------------------------------------------------------------
+    # 4. UNIR RETRIES AO LOTE
+    # ------------------------------------------------------------------
+
+    for temp in recovered:
+
+        ticker = temp.columns[0]
+
+        if close.empty:
+            close = temp.copy()
+
+        else:
+            close = close.drop(
+                columns=[ticker],
+                errors="ignore",
+            )
+
+            close = close.join(
+                temp,
+                how="outer",
+            )
+
+    if close.empty:
+        raise RuntimeError(
+            "Download de preços retornou vazio. "
+            f"Último erro: {last_error}"
+        )
+
+    # ------------------------------------------------------------------
+    # 5. AUDITORIA FINAL — NÃO ACEITAR TICKER SEM PREÇO
+    # ------------------------------------------------------------------
+
+    still_missing = [
+        ticker
+        for ticker in tickers
+        if (
+            ticker not in close.columns
+            or
+            close[ticker].dropna().empty
+        )
     ]
 
-    close.index = pd.to_datetime(
-        close.index
-    )
+    if still_missing:
 
-    try:
-
-        close.index = (
-            close.index
-            .tz_localize(
-                None
+        raise RuntimeError(
+            "Falha no download de preços para: "
+            +
+            ", ".join(
+                still_missing
             )
         )
 
-    except Exception:
-        pass
+    # Garante a mesma ordem recebida.
+    close = close[
+        tickers
+    ].copy()
 
     return (
         close
