@@ -1,1809 +1,744 @@
 # ======================================================================================
 # PORTFOLIO ACOES AMERICANO
-# entry.py
+# entry.py — VERSÃO CORRIGIDA / ALINHADA À CÉLULA 41
 # ======================================================================================
 #
-# RESPONSABILIDADE
-# ---------------
-# Classificar o momento de entrada das 15 ações JÁ SELECIONADAS.
+# CORREÇÃO CENTRAL
+# ----------------
+# O signal_percentile NÃO é o rank das 5 ações atuais.
+# Ele é o percentil do final_signal_score atual contra TODO o histórico anterior
+# daquele SETOR, exatamente como na Célula 41.
 #
-# Este módulo NÃO escolhe empresas e NÃO altera a carteira.
+# Componentes também são normalizados point-in-time contra o PRÓPRIO histórico
+# de cada ação:
 #
-# ARQUITETURA VALIDADA HISTORICAMENTE
-# -----------------------------------
+#   Valuation     -> 5 múltiplos; menor é melhor; mediana; mínimo 2
+#   Desconto      -> 4 métricas; menor valor bruto = mais descontado;
+#                    mediana; mínimo 2
+#   Fundamentos   -> 7 componentes; maior é melhor; mediana; mínimo 3
 #
-# Health Care
-#   10% Valuation
-#   80% Desconto
-#   10% Fundamentos
+# Arquitetura:
+#   Health Care             10% valuation + 80% desconto + 10% fundamentos
+#   Industrials              0% valuation + 20% desconto + 80% fundamentos
+#   Information Technology   Momentum 6M + 12M
 #
-# Industrials
-#   20% Desconto
-#   80% Fundamentos
-#   Regra CONDICIONAL
-#   Nunca recebe ENTRADA FORTE
-#
-# Information Technology
-#   Momentum 6M + 12M
-#
-# CLASSIFICAÇÃO FINAL
-# -------------------
-#
-#   >= 75º percentil  -> ENTRADA FORTE
-#   >= 50º percentil  -> ENTRADA
-#   >= 25º percentil  -> AGUARDAR
-#   <  25º percentil  -> NÃO COMPRAR AGORA
-#
-# Industrials:
-#   ENTRADA FORTE é rebaixada para ENTRADA.
-#
+# Industrials nunca recebe ENTRADA FORTE.
 # ======================================================================================
 
 from __future__ import annotations
 
 from typing import Dict, Iterable, Optional
-
 import numpy as np
 import pandas as pd
 
 from config import SECTORS
 
-
-# ======================================================================================
-# 1. CONSTANTES
-# ======================================================================================
-
 HEALTH_CARE = "Health Care"
 INDUSTRIALS = "Industrials"
 TECHNOLOGY = "Information Technology"
 
+MIN_HISTORY = 24
+MIN_VALUATION_COMPONENTS = 2
+MIN_DISCOUNT_COMPONENTS = 2
+MIN_FUNDAMENTAL_COMPONENTS = 3
 
-ENTRY_STRONG_PERCENTILE = 0.75
-ENTRY_PERCENTILE = 0.50
-WAIT_PERCENTILE = 0.25
-
-
-ENTRY_METHODS = {
-
-    HEALTH_CARE:
-        "10% Valuation + 80% Desconto + 10% Fundamentos",
-
-    INDUSTRIALS:
-        "20% Desconto + 80% Fundamentos",
-
-    TECHNOLOGY:
-        "Momentum 6M + 12M",
-}
-
-
-SECTOR_VALIDATION_STATUS = {
-
-    HEALTH_CARE:
-        "APROVADO",
-
-    INDUSTRIALS:
-        "CONDICIONAL",
-
-    TECHNOLOGY:
-        "REGRA ALTERNATIVA APROVADA",
-}
-
-
-# ======================================================================================
-# 2. HELPERS
-# ======================================================================================
-
-def safe_numeric(
-    series: pd.Series,
-) -> pd.Series:
-
-    return (
-        pd.to_numeric(
-            series,
-            errors="coerce",
-        )
-        .replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
-    )
-
-
-def safe_divide(
-    numerator: pd.Series,
-    denominator: pd.Series,
-) -> pd.Series:
-
-    numerator = safe_numeric(
-        numerator
-    )
-
-    denominator = safe_numeric(
-        denominator
-    )
-
-    result = (
-        numerator
-        /
-        denominator.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    return result.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-
-def percentile_score(
-    series: pd.Series,
-    higher_is_better: bool = True,
-) -> pd.Series:
-    """
-    Percentil transversal.
-
-    Sempre:
-        valor maior = melhor sinal.
-    """
-
-    values = safe_numeric(
-        series
-    )
-
-    return values.rank(
-        pct=True,
-        ascending=higher_is_better,
-        method="average",
-    )
-
-
-def historical_percentile(
-    current_value,
-    history: pd.Series,
-    lower_is_better: bool = True,
-) -> float:
-    """
-    Percentil do valor atual contra o próprio histórico.
-
-    Retorno sempre padronizado:
-        1.0 = condição mais favorável
-        0.0 = condição menos favorável
-    """
-
-    current_value = pd.to_numeric(
-        pd.Series(
-            [current_value]
-        ),
-        errors="coerce",
-    ).iloc[0]
-
-    hist = (
-        pd.to_numeric(
-            history,
-            errors="coerce",
-        )
-        .replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
-        .dropna()
-    )
-
-    if (
-        pd.isna(current_value)
-        or
-        hist.empty
-    ):
-        return np.nan
-
-    percentile = float(
-        (
-            hist
-            <=
-            current_value
-        ).mean()
-    )
-
-    if lower_is_better:
-        percentile = 1.0 - percentile
-
-    return percentile
-
-
-def mean_valid(
-    values: Iterable,
-    minimum: int = 1,
-) -> float:
-
-    values = pd.to_numeric(
-        pd.Series(
-            list(values)
-        ),
-        errors="coerce",
-    )
-
-    values = values.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-    valid = values.dropna()
-
-    if len(valid) < minimum:
-        return np.nan
-
-    return float(
-        valid.mean()
-    )
-
-
-# ======================================================================================
-# 3. VALUATION SCORE
-# ======================================================================================
-
-VALUATION_METRICS = [
-    "pe",
-    "pb",
-    "ps",
-    "p_ocf",
-    "p_fcf",
+VALUATION_METRICS = ["pe", "pb", "ps", "p_ocf", "p_fcf"]
+DISCOUNT_METRICS = [
+    "drawdown_52w",
+    "drawdown_3y",
+    "distance_ma200",
+    "price_position_3y",
+]
+FUNDAMENTAL_COMPONENTS = [
+    "revenue_growth_yoy",
+    "net_income_growth_yoy",
+    "operating_cash_flow_growth_yoy",
+    "diluted_eps_growth_yoy",
+    "net_margin",
+    "ocf_margin",
+    "fcf_margin",
 ]
 
+ENTRY_METHODS = {
+    HEALTH_CARE: "10% Valuation + 80% Desconto + 10% Fundamentos",
+    INDUSTRIALS: "20% Desconto + 80% Fundamentos",
+    TECHNOLOGY: "Momentum 6M + 12M",
+}
 
-def calculate_valuation_score(
-    current_row: pd.Series,
-    historical_valuation: pd.DataFrame,
-) -> float:
-    """
-    Mede quão barata a empresa está contra o PRÓPRIO histórico.
+SECTOR_VALIDATION_STATUS = {
+    HEALTH_CARE: "APROVADO",
+    INDUSTRIALS: "CONDICIONAL",
+    TECHNOLOGY: "REGRA ALTERNATIVA APROVADA",
+}
 
-    Múltiplos:
-        PE
-        PB
-        PS
-        P/OCF
-        P/FCF
 
-    Múltiplo menor = melhor valuation.
-    """
+# ======================================================================================
+# HELPERS
+# ======================================================================================
 
-    ticker = str(
-        current_row[
-            "ticker"
-        ]
-    ).upper()
-
-    history = historical_valuation[
-        historical_valuation[
-            "ticker"
-        ].astype(str).str.upper()
-        ==
-        ticker
-    ].copy()
-
-    if history.empty:
+def _num(value):
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else np.nan
+    except Exception:
         return np.nan
 
-    components = []
 
-    for metric in VALUATION_METRICS:
+def _safe_div(a, b):
+    a = _num(a)
+    b = _num(b)
+    if not np.isfinite(a) or not np.isfinite(b) or abs(b) <= 1e-12:
+        return np.nan
+    value = a / b
+    return value if np.isfinite(value) else np.nan
 
-        if (
-            metric not in current_row.index
-            or
-            metric not in history.columns
-        ):
+
+def _midrank_percentile(current: float, history: Iterable[float]) -> float:
+    """Percentil = (n menores + 0.5*n iguais) / n."""
+    current = _num(current)
+    hist = np.asarray(
+        [float(x) for x in history if np.isfinite(_num(x))],
+        dtype=float,
+    )
+    if not np.isfinite(current) or len(hist) < MIN_HISTORY:
+        return np.nan
+    less = np.sum(hist < current)
+    equal = np.sum(hist == current)
+    return float((less + 0.5 * equal) / len(hist))
+
+
+def _expanding_score(
+    values: pd.Series,
+    higher_is_better: bool,
+    min_history: int = MIN_HISTORY,
+) -> pd.Series:
+    """
+    Score point-in-time. O valor atual nunca participa do próprio benchmark.
+    """
+    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    out = np.full(len(arr), np.nan)
+    history = []
+
+    for i, current in enumerate(arr):
+        if np.isfinite(current) and len(history) >= min_history:
+            hist = np.asarray(history, dtype=float)
+            less = np.sum(hist < current)
+            equal = np.sum(hist == current)
+            pct = (less + 0.5 * equal) / len(hist)
+            out[i] = pct if higher_is_better else 1.0 - pct
+
+        if np.isfinite(current):
+            history.append(float(current))
+
+    return pd.Series(out, index=values.index, dtype=float)
+
+
+def _weighted_score(df: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
+    """
+    Igual à Célula 41: componentes ausentes têm peso removido do denominador.
+    """
+    cols = list(weights)
+    components = df[cols].apply(pd.to_numeric, errors="coerce")
+    w = pd.Series(weights, dtype=float)
+
+    available = components.notna()
+    effective_weights = available.mul(w, axis=1)
+
+    numerator = (
+        components.fillna(0)
+        .mul(effective_weights, axis=1)
+        .sum(axis=1)
+    )
+    denominator = effective_weights.sum(axis=1).replace(0, np.nan)
+    return numerator / denominator
+
+
+def _label(score, names):
+    score = _num(score)
+    if not np.isfinite(score):
+        return "N/D"
+    if score >= 0.80:
+        return names[0]
+    if score >= 0.65:
+        return names[1]
+    if score >= 0.40:
+        return names[2]
+    if score >= 0.20:
+        return names[3]
+    return names[4]
+
+
+def valuation_status(score):
+    return _label(
+        score,
+        ["MUITO BARATA", "BARATA", "NEUTRA", "CARA", "MUITO CARA"],
+    )
+
+
+def discount_status(score):
+    return _label(
+        score,
+        ["MUITO ALTO", "ALTO", "MÉDIO", "BAIXO", "SEM DESCONTO"],
+    )
+
+
+def fundamental_status(score):
+    return _label(
+        score,
+        ["MUITO FORTES", "FORTES", "PRESERVADOS", "ENFRAQUECENDO", "FRACOS"],
+    )
+
+
+def classify_entry(signal_percentile: float, sector: str) -> str:
+    pct = _num(signal_percentile)
+
+    if not np.isfinite(pct):
+        return "AGUARDAR"
+
+    if pct >= 0.75:
+        signal = "ENTRADA FORTE"
+    elif pct >= 0.50:
+        signal = "ENTRADA"
+    elif pct >= 0.25:
+        signal = "AGUARDAR"
+    else:
+        signal = "NÃO COMPRAR AGORA"
+
+    if sector == INDUSTRIALS and signal == "ENTRADA FORTE":
+        signal = "ENTRADA"
+
+    return signal
+
+
+# ======================================================================================
+# PREÇOS — HISTÓRICO DE DESCONTO + MOMENTUM
+# ======================================================================================
+
+def _build_daily_price_indicators(prices: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    parts = []
+
+    for ticker in tickers:
+        if ticker not in prices.columns:
             continue
 
-        score = historical_percentile(
-            current_value=current_row[
-                metric
-            ],
-            history=history[
-                metric
-            ],
-            lower_is_better=True,
+        s = pd.to_numeric(prices[ticker], errors="coerce").dropna().sort_index()
+        if s.empty:
+            continue
+
+        temp = pd.DataFrame({"date": s.index, "ticker": ticker, "price": s.values})
+
+        temp["high_52w"] = temp["price"].rolling(252, min_periods=126).max()
+        temp["drawdown_52w"] = temp["price"] / temp["high_52w"] - 1.0
+
+        temp["high_3y"] = temp["price"].rolling(756, min_periods=252).max()
+        temp["low_3y"] = temp["price"].rolling(756, min_periods=252).min()
+        temp["drawdown_3y"] = temp["price"] / temp["high_3y"] - 1.0
+
+        temp["ma200"] = temp["price"].rolling(200, min_periods=150).mean()
+        temp["distance_ma200"] = temp["price"] / temp["ma200"] - 1.0
+
+        range_3y = (temp["high_3y"] - temp["low_3y"]).replace(0, np.nan)
+        temp["price_position_3y"] = (
+            (temp["price"] - temp["low_3y"]) / range_3y
         )
 
-        components.append(
-            score
-        )
+        temp["momentum_6m"] = temp["price"] / temp["price"].shift(126) - 1.0
+        temp["momentum_12m"] = temp["price"] / temp["price"].shift(252) - 1.0
 
-    return mean_valid(
-        components,
-        minimum=2,
-    )
+        parts.append(temp)
+
+    if not parts:
+        return pd.DataFrame()
+
+    return pd.concat(parts, ignore_index=True)
 
 
 # ======================================================================================
-# 4. DESCONTO DE PREÇO
+# FUNDAMENTOS POINT-IN-TIME
 # ======================================================================================
 
-def calculate_discount_metrics(
-    prices: pd.Series,
+def _prepare_facts(fundamentals_history: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    required = {"ticker", "metric", "value", "available_date", "end"}
+    if fundamentals_history is None or fundamentals_history.empty:
+        raise RuntimeError("Histórico fundamental vazio.")
+    if not required.issubset(fundamentals_history.columns):
+        raise RuntimeError(
+            f"Histórico fundamental precisa conter: {sorted(required)}"
+        )
+
+    facts = fundamentals_history.copy()
+    facts["ticker"] = facts["ticker"].astype(str).str.upper().str.strip()
+    facts = facts[facts["ticker"].isin(tickers)].copy()
+    facts["available_date"] = pd.to_datetime(facts["available_date"], errors="coerce")
+    facts["end"] = pd.to_datetime(facts["end"], errors="coerce")
+    facts["value"] = pd.to_numeric(facts["value"], errors="coerce")
+    facts = facts.dropna(subset=["ticker", "metric", "value", "available_date", "end"])
+    return facts.sort_values(["ticker", "metric", "available_date", "end"])
+
+
+def _latest_metric(history: pd.DataFrame, metric: str, snapshot: pd.Timestamp):
+    temp = history[
+        (history["metric"] == metric)
+        & (history["available_date"] <= snapshot)
+    ]
+    if temp.empty:
+        return None
+    return temp.sort_values(["available_date", "end"]).iloc[-1]
+
+
+def _growth_yoy(history: pd.DataFrame, metric: str, snapshot: pd.Timestamp) -> float:
+    current = _latest_metric(history, metric, snapshot)
+    if current is None:
+        return np.nan
+
+    current_end = pd.Timestamp(current["end"])
+    candidates = history[
+        (history["metric"] == metric)
+        & (history["available_date"] <= snapshot)
+        & (history["end"] < current_end)
+    ].copy()
+
+    if candidates.empty:
+        return np.nan
+
+    candidates["days_diff"] = (current_end - candidates["end"]).dt.days
+    candidates = candidates[candidates["days_diff"].between(300, 430)].copy()
+
+    # Quando possível, prioriza o mesmo fiscal period.
+    if "fp" in candidates.columns and "fp" in current.index:
+        same_fp = candidates[candidates["fp"] == current.get("fp")]
+        if not same_fp.empty:
+            candidates = same_fp
+
+    if candidates.empty:
+        return np.nan
+
+    candidates["distance"] = (candidates["days_diff"] - 365).abs()
+    previous = candidates.sort_values(
+        ["distance", "available_date"],
+        ascending=[True, False],
+    ).iloc[0]
+
+    return _safe_div(current["value"], previous["value"]) - 1.0
+
+
+def _snapshot_fundamentals(
+    ticker_history: pd.DataFrame,
+    snapshot: pd.Timestamp,
 ) -> Dict[str, float]:
-    """
-    Componentes de desconto utilizados no estudo:
+    raw = {}
 
-        • drawdown 52 semanas
-        • drawdown 3 anos
-        • distância da média de 200 dias
-        • posição na faixa de 3 anos
+    for metric in [
+        "revenue",
+        "net_income",
+        "operating_income",
+        "operating_cash_flow",
+        "capex",
+        "assets",
+        "equity",
+        "cash",
+        "long_term_debt",
+        "short_term_debt",
+        "diluted_eps",
+        "diluted_shares",
+    ]:
+        row = _latest_metric(ticker_history, metric, snapshot)
+        raw[metric] = _num(row["value"]) if row is not None else np.nan
 
-    Todos são convertidos para:
-        maior score = maior desconto.
-    """
+    revenue = raw["revenue"]
+    net_income = raw["net_income"]
+    ocf = raw["operating_cash_flow"]
+    capex = raw["capex"]
 
-    prices = (
-        safe_numeric(
-            prices
-        )
-        .dropna()
-        .sort_index()
-    )
-
-    if prices.empty:
-
-        return {
-            "discount_52w":
-                np.nan,
-
-            "discount_3y":
-                np.nan,
-
-            "discount_ma200":
-                np.nan,
-
-            "range_position_3y":
-                np.nan,
-        }
-
-    current = float(
-        prices.iloc[-1]
-    )
-
-    # ------------------------------------------------------------------
-    # 52 semanas
-    # ------------------------------------------------------------------
-
-    window_52w = (
-        prices
-        .tail(252)
-    )
-
-    high_52w = (
-        window_52w.max()
-        if not window_52w.empty
+    fcf = (
+        ocf - abs(capex)
+        if np.isfinite(ocf) and np.isfinite(capex)
         else np.nan
     )
-
-    discount_52w = (
-        1.0
-        -
-        current / high_52w
-        if (
-            pd.notna(high_52w)
-            and
-            high_52w > 0
-        )
-        else np.nan
-    )
-
-    # ------------------------------------------------------------------
-    # 3 anos
-    # ------------------------------------------------------------------
-
-    window_3y = (
-        prices
-        .tail(756)
-    )
-
-    high_3y = (
-        window_3y.max()
-        if not window_3y.empty
-        else np.nan
-    )
-
-    low_3y = (
-        window_3y.min()
-        if not window_3y.empty
-        else np.nan
-    )
-
-    discount_3y = (
-        1.0
-        -
-        current / high_3y
-        if (
-            pd.notna(high_3y)
-            and
-            high_3y > 0
-        )
-        else np.nan
-    )
-
-    # ------------------------------------------------------------------
-    # Média 200 dias
-    #
-    # Positivo quando preço está abaixo da média.
-    # ------------------------------------------------------------------
-
-    ma200 = (
-        prices
-        .tail(200)
-        .mean()
-        if len(prices) >= 200
-        else np.nan
-    )
-
-    discount_ma200 = (
-        1.0
-        -
-        current / ma200
-        if (
-            pd.notna(ma200)
-            and
-            ma200 > 0
-        )
-        else np.nan
-    )
-
-    # ------------------------------------------------------------------
-    # Posição na faixa de 3 anos
-    #
-    # 0 = mínima
-    # 1 = máxima
-    #
-    # Para score de desconto:
-    #     1 - posição
-    # ------------------------------------------------------------------
-
-    if (
-        pd.notna(high_3y)
-        and
-        pd.notna(low_3y)
-        and
-        high_3y > low_3y
-    ):
-
-        position = (
-            current
-            -
-            low_3y
-        ) / (
-            high_3y
-            -
-            low_3y
-        )
-
-        range_discount = (
-            1.0
-            -
-            position
-        )
-
-    else:
-
-        range_discount = np.nan
 
     return {
-        "discount_52w":
-            discount_52w,
-
-        "discount_3y":
-            discount_3y,
-
-        "discount_ma200":
-            discount_ma200,
-
-        "range_position_3y":
-            range_discount,
+        **raw,
+        "revenue_growth_yoy": _growth_yoy(ticker_history, "revenue", snapshot),
+        "net_income_growth_yoy": _growth_yoy(ticker_history, "net_income", snapshot),
+        "operating_cash_flow_growth_yoy": _growth_yoy(
+            ticker_history, "operating_cash_flow", snapshot
+        ),
+        "diluted_eps_growth_yoy": _growth_yoy(ticker_history, "diluted_eps", snapshot),
+        "net_margin": _safe_div(net_income, revenue),
+        "ocf_margin": _safe_div(ocf, revenue),
+        "fcf_margin": _safe_div(fcf, revenue),
+        "free_cash_flow": fcf,
     }
 
 
-def build_discount_table(
+def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
+    shares = _num(f.get("diluted_shares"))
+    market_cap = (
+        price * shares
+        if np.isfinite(price) and np.isfinite(shares) and shares > 0
+        else np.nan
+    )
+
+    eps = _num(f.get("diluted_eps"))
+    equity = _num(f.get("equity"))
+    revenue = _num(f.get("revenue"))
+    ocf = _num(f.get("operating_cash_flow"))
+    fcf = _num(f.get("free_cash_flow"))
+
+    # múltiplos negativos/não econômicos são tratados como ausentes
+    pe = price / eps if np.isfinite(eps) and eps > 0 else np.nan
+    pb = market_cap / equity if np.isfinite(market_cap) and np.isfinite(equity) and equity > 0 else np.nan
+    ps = market_cap / revenue if np.isfinite(market_cap) and np.isfinite(revenue) and revenue > 0 else np.nan
+    p_ocf = market_cap / ocf if np.isfinite(market_cap) and np.isfinite(ocf) and ocf > 0 else np.nan
+    p_fcf = market_cap / fcf if np.isfinite(market_cap) and np.isfinite(fcf) and fcf > 0 else np.nan
+
+    return {"pe": pe, "pb": pb, "ps": ps, "p_ocf": p_ocf, "p_fcf": p_fcf}
+
+
+# ======================================================================================
+# CONSTRUIR HISTÓRICO MENSAL DO ENTRY SCORE
+# ======================================================================================
+
+def build_entry_signal_history(
     portfolio: pd.DataFrame,
     prices: pd.DataFrame,
+    fundamentals_history: pd.DataFrame,
+    as_of_date=None,
+    start_date: str = "2015-01-31",
 ) -> pd.DataFrame:
+
+    if as_of_date is None:
+        as_of_date = pd.Timestamp.today().normalize()
+    else:
+        as_of_date = pd.Timestamp(as_of_date).normalize()
+
+    p = portfolio.copy()
+    p["ticker"] = p["ticker"].astype(str).str.upper().str.strip()
+    sector_map = p.set_index("ticker")["sector"].to_dict()
+    tickers = p["ticker"].tolist()
+
+    # Datas mensais + snapshot atual.
+    monthly = list(pd.date_range(start=start_date, end=as_of_date, freq="ME"))
+    if not monthly or monthly[-1].normalize() != as_of_date:
+        monthly.append(as_of_date)
+    snapshot_dates = sorted(pd.DatetimeIndex(monthly).unique())
+
+    daily = _build_daily_price_indicators(prices, tickers)
+    if daily.empty:
+        raise RuntimeError("Não foi possível construir indicadores de preço.")
+
+    facts = _prepare_facts(fundamentals_history, tickers)
 
     rows = []
 
-    for ticker in (
-        portfolio[
-            "ticker"
-        ]
-        .astype(str)
-        .str.upper()
-    ):
+    for ticker in tickers:
+        price_hist = daily[daily["ticker"] == ticker].sort_values("date").copy()
+        fact_hist = facts[facts["ticker"] == ticker].copy()
 
-        if ticker not in prices.columns:
+        if price_hist.empty:
+            continue
 
-            metrics = {
-                "discount_52w":
-                    np.nan,
+        for snapshot in snapshot_dates:
+            price_rows = price_hist[price_hist["date"] <= snapshot]
+            if price_rows.empty:
+                continue
 
-                "discount_3y":
-                    np.nan,
+            pr = price_rows.iloc[-1]
+            # tolerância de 10 dias como no estudo
+            if (snapshot - pd.Timestamp(pr["date"])).days > 10:
+                continue
 
-                "discount_ma200":
-                    np.nan,
+            f = _snapshot_fundamentals(fact_hist, snapshot)
+            valuation = _valuation_raw(_num(pr["price"]), f)
 
-                "range_position_3y":
-                    np.nan,
-            }
-
-        else:
-
-            metrics = (
-                calculate_discount_metrics(
-                    prices[
-                        ticker
-                    ]
-                )
+            rows.append(
+                {
+                    "snapshot_date": snapshot,
+                    "sector": sector_map[ticker],
+                    "ticker": ticker,
+                    "market_price": _num(pr["price"]),
+                    **valuation,
+                    **{k: f.get(k, np.nan) for k in FUNDAMENTAL_COMPONENTS},
+                    **{k: _num(pr[k]) for k in DISCOUNT_METRICS},
+                    "momentum_6m": _num(pr["momentum_6m"]),
+                    "momentum_12m": _num(pr["momentum_12m"]),
+                }
             )
 
-        rows.append(
-            {
-                "ticker":
-                    ticker,
+    hist = pd.DataFrame(rows)
+    if hist.empty:
+        raise RuntimeError("Histórico mensal de entrada ficou vazio.")
 
-                **metrics,
-            }
-        )
+    hist = hist.sort_values(["ticker", "snapshot_date"]).reset_index(drop=True)
 
-    table = pd.DataFrame(
-        rows
-    )
+    # ------------------------------------------------------------------
+    # VALUATION: próprio histórico; menor múltiplo = melhor; mediana
+    # ------------------------------------------------------------------
+    for metric in VALUATION_METRICS:
+        hist[f"{metric}_relative_score"] = np.nan
 
-    discount_columns = [
-        "discount_52w",
-        "discount_3y",
-        "discount_ma200",
-        "range_position_3y",
-    ]
+    for ticker, idx in hist.groupby("ticker").groups.items():
+        idx = list(idx)
+        temp = hist.loc[idx].sort_values("snapshot_date")
+        for metric in VALUATION_METRICS:
+            scores = _expanding_score(temp[metric], higher_is_better=False)
+            hist.loc[temp.index, f"{metric}_relative_score"] = scores.values
 
-    table[
-        "discount_score"
-    ] = (
-        table[
-            discount_columns
-        ]
-        .mean(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-    table[
-        "discount_components"
-    ] = (
-        table[
-            discount_columns
-        ]
-        .notna()
-        .sum(
-            axis=1
-        )
-    )
-
-    table.loc[
-        table[
-            "discount_components"
-        ]
-        <
-        2,
-        "discount_score",
+    val_cols = [f"{m}_relative_score" for m in VALUATION_METRICS]
+    hist["valid_relative_metrics"] = hist[val_cols].notna().sum(axis=1)
+    hist["relative_valuation_score"] = hist[val_cols].median(axis=1, skipna=True)
+    hist.loc[
+        hist["valid_relative_metrics"] < MIN_VALUATION_COMPONENTS,
+        "relative_valuation_score",
     ] = np.nan
 
-    return table
+    # ------------------------------------------------------------------
+    # DESCONTO: próprio histórico; bruto menor = mais descontado; mediana
+    # ------------------------------------------------------------------
+    for metric in DISCOUNT_METRICS:
+        hist[f"{metric}_discount_score"] = np.nan
 
+    for ticker, idx in hist.groupby("ticker").groups.items():
+        temp = hist.loc[list(idx)].sort_values("snapshot_date")
+        for metric in DISCOUNT_METRICS:
+            scores = _expanding_score(temp[metric], higher_is_better=False)
+            hist.loc[temp.index, f"{metric}_discount_score"] = scores.values
 
-# ======================================================================================
-# 5. FUNDAMENTAL PRESERVATION
-# ======================================================================================
-
-FUNDAMENTAL_COMPONENTS = [
-    "revenue_growth",
-    "eps_growth",
-    "operating_cash_flow_growth",
-    "operating_margin",
-    "net_margin",
-]
-
-
-def calculate_fundamental_preservation(
-    portfolio: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Converte os fundamentos atuais em score transversal.
-
-    Componentes preservados do estudo:
-        crescimento de receita
-        crescimento de EPS
-        crescimento de OCF
-        margem operacional
-        margem líquida
-    """
-
-    df = portfolio.copy()
-
-    available_components = []
-
-    for metric in FUNDAMENTAL_COMPONENTS:
-
-        if metric not in df.columns:
-            df[metric] = np.nan
-
-        component_name = (
-            f"{metric}_entry_pct"
-        )
-
-        df[
-            component_name
-        ] = percentile_score(
-            df[
-                metric
-            ],
-            higher_is_better=True,
-        )
-
-        available_components.append(
-            component_name
-        )
-
-    df[
-        "fundamental_score"
-    ] = (
-        df[
-            available_components
-        ]
-        .mean(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-    df[
-        "fundamental_components"
-    ] = (
-        df[
-            available_components
-        ]
-        .notna()
-        .sum(
-            axis=1
-        )
-    )
-
-    df.loc[
-        df[
-            "fundamental_components"
-        ]
-        <
-        2,
-        "fundamental_score",
+    dis_cols = [f"{m}_discount_score" for m in DISCOUNT_METRICS]
+    hist["valid_discount_metrics"] = hist[dis_cols].notna().sum(axis=1)
+    hist["price_discount_score"] = hist[dis_cols].median(axis=1, skipna=True)
+    hist.loc[
+        hist["valid_discount_metrics"] < MIN_DISCOUNT_COMPONENTS,
+        "price_discount_score",
     ] = np.nan
 
-    return df
+    # ------------------------------------------------------------------
+    # FUNDAMENTOS: próprio histórico; maior = melhor; mediana
+    # ------------------------------------------------------------------
+    for component in FUNDAMENTAL_COMPONENTS:
+        hist[f"{component}_score"] = np.nan
 
+    for ticker, idx in hist.groupby("ticker").groups.items():
+        temp = hist.loc[list(idx)].sort_values("snapshot_date")
+        for component in FUNDAMENTAL_COMPONENTS:
+            scores = _expanding_score(temp[component], higher_is_better=True)
+            hist.loc[temp.index, f"{component}_score"] = scores.values
 
-# ======================================================================================
-# 6. MOMENTUM TECHNOLOGY
-# ======================================================================================
+    fund_cols = [f"{c}_score" for c in FUNDAMENTAL_COMPONENTS]
+    hist["valid_fundamental_components"] = hist[fund_cols].notna().sum(axis=1)
+    hist["fundamental_preservation_score"] = hist[fund_cols].median(axis=1, skipna=True)
+    hist.loc[
+        hist["valid_fundamental_components"] < MIN_FUNDAMENTAL_COMPONENTS,
+        "fundamental_preservation_score",
+    ] = np.nan
 
-def calculate_momentum(
-    prices: pd.Series,
-    months: int,
-) -> float:
+    # ------------------------------------------------------------------
+    # FINAL SIGNAL SCORE
+    # ------------------------------------------------------------------
+    hist["final_signal_score"] = np.nan
+    hist["valid_signal_components"] = 0
 
-    prices = (
-        safe_numeric(
-            prices
-        )
-        .dropna()
-        .sort_index()
+    mask = hist["sector"] == HEALTH_CARE
+    h = hist.loc[mask].copy()
+    h["valuation"] = h["relative_valuation_score"]
+    h["discount"] = h["price_discount_score"]
+    h["fundamental"] = h["fundamental_preservation_score"]
+    hist.loc[mask, "final_signal_score"] = _weighted_score(
+        h,
+        {"valuation": 0.10, "discount": 0.80, "fundamental": 0.10},
+    ).values
+    hist.loc[mask, "valid_signal_components"] = h[
+        ["valuation", "discount", "fundamental"]
+    ].notna().sum(axis=1).values
+
+    mask = hist["sector"] == INDUSTRIALS
+    ind = hist.loc[mask].copy()
+    ind["valuation"] = ind["relative_valuation_score"]
+    ind["discount"] = ind["price_discount_score"]
+    ind["fundamental"] = ind["fundamental_preservation_score"]
+    hist.loc[mask, "final_signal_score"] = _weighted_score(
+        ind,
+        {"valuation": 0.00, "discount": 0.20, "fundamental": 0.80},
+    ).values
+    hist.loc[mask, "valid_signal_components"] = ind[
+        ["discount", "fundamental"]
+    ].notna().sum(axis=1).values
+
+    # Technology: cross-sectional por snapshot, exatamente como Célula 41
+    mask = hist["sector"] == TECHNOLOGY
+    tech = hist.loc[mask].copy()
+    tech["momentum_6m_score"] = (
+        tech.groupby("snapshot_date")["momentum_6m"].rank(pct=True, ascending=True)
     )
-
-    trading_days = (
-        21
-        *
-        months
+    tech["momentum_12m_score"] = (
+        tech.groupby("snapshot_date")["momentum_12m"].rank(pct=True, ascending=True)
     )
-
-    if len(prices) <= trading_days:
-
-        return np.nan
-
-    current = float(
-        prices.iloc[-1]
+    tech["tech_score"] = (
+        0.50 * tech["momentum_6m_score"]
+        + 0.50 * tech["momentum_12m_score"]
     )
+    hist.loc[tech.index, "momentum_6m_score"] = tech["momentum_6m_score"]
+    hist.loc[tech.index, "momentum_12m_score"] = tech["momentum_12m_score"]
+    hist.loc[tech.index, "final_signal_score"] = tech["tech_score"]
+    hist.loc[tech.index, "valid_signal_components"] = tech[
+        ["momentum_6m_score", "momentum_12m_score"]
+    ].notna().sum(axis=1)
 
-    previous = float(
-        prices.iloc[
-            -trading_days - 1
-        ]
-    )
+    # ------------------------------------------------------------------
+    # PERCENTIL HISTÓRICO DO SINAL POR SETOR
+    # Célula 41: benchmark contém apenas snapshots ANTERIORES.
+    # ------------------------------------------------------------------
+    hist["signal_percentile"] = np.nan
 
-    if (
-        previous == 0
-        or
-        not np.isfinite(previous)
-    ):
-        return np.nan
+    for sector in SECTORS:
+        sector_idx = hist["sector"] == sector
+        dates = sorted(hist.loc[sector_idx, "snapshot_date"].dropna().unique())
+        previous_scores = []
 
-    return (
-        current
-        /
-        previous
-        -
-        1.0
-    )
-
-
-def build_technology_momentum(
-    portfolio: pd.DataFrame,
-    prices: pd.DataFrame,
-) -> pd.DataFrame:
-
-    technology = portfolio[
-        portfolio[
-            "sector"
-        ]
-        ==
-        TECHNOLOGY
-    ].copy()
-
-    rows = []
-
-    for ticker in (
-        technology[
-            "ticker"
-        ]
-        .astype(str)
-        .str.upper()
-    ):
-
-        if ticker not in prices.columns:
-
-            momentum_6m = np.nan
-            momentum_12m = np.nan
-
-        else:
-
-            series = prices[
-                ticker
+        for snapshot in dates:
+            current_idx = hist.index[
+                sector_idx & (hist["snapshot_date"] == snapshot)
             ]
 
-            momentum_6m = (
-                calculate_momentum(
-                    series,
-                    6,
-                )
-            )
-
-            momentum_12m = (
-                calculate_momentum(
-                    series,
-                    12,
-                )
-            )
-
-        rows.append(
-            {
-                "ticker":
-                    ticker,
-
-                "momentum_6m":
-                    momentum_6m,
-
-                "momentum_12m":
-                    momentum_12m,
-            }
-        )
-
-    result = pd.DataFrame(
-        rows
-    )
-
-    if result.empty:
-        return result
-
-    result[
-        "momentum_6m_pct"
-    ] = percentile_score(
-        result[
-            "momentum_6m"
-        ],
-        higher_is_better=True,
-    )
-
-    result[
-        "momentum_12m_pct"
-    ] = percentile_score(
-        result[
-            "momentum_12m"
-        ],
-        higher_is_better=True,
-    )
-
-    # Regra vencedora:
-    # combinação 6M + 12M
-
-    result[
-        "momentum_score"
-    ] = (
-        result[
-            [
-                "momentum_6m_pct",
-                "momentum_12m_pct",
+            benchmark = [
+                x for x in previous_scores if np.isfinite(_num(x))
             ]
-        ]
-        .mean(
-            axis=1,
-            skipna=True,
-        )
-    )
 
-    return result
+            if len(benchmark) >= MIN_HISTORY:
+                for idx in current_idx:
+                    score = _num(hist.at[idx, "final_signal_score"])
+                    hist.at[idx, "signal_percentile"] = _midrank_percentile(
+                        score,
+                        benchmark,
+                    )
 
+            previous_scores.extend(
+                hist.loc[current_idx, "final_signal_score"].dropna().tolist()
+            )
 
-# ======================================================================================
-# 7. STATUS DESCRITIVOS
-# ======================================================================================
-
-def valuation_status(
-    percentile: float,
-) -> str:
-
-    if pd.isna(percentile):
-        return "N/D"
-
-    if percentile >= 0.80:
-        return "MUITO BARATA"
-
-    if percentile >= 0.60:
-        return "BARATA"
-
-    if percentile >= 0.40:
-        return "NEUTRA"
-
-    if percentile >= 0.20:
-        return "CARA"
-
-    return "MUITO CARA"
-
-
-def discount_status(
-    percentile: float,
-) -> str:
-
-    if pd.isna(percentile):
-        return "N/D"
-
-    if percentile >= 0.80:
-        return "MUITO ALTO"
-
-    if percentile >= 0.60:
-        return "ALTO"
-
-    if percentile >= 0.40:
-        return "MÉDIO"
-
-    if percentile >= 0.20:
-        return "BAIXO"
-
-    return "SEM DESCONTO"
-
-
-def fundamental_status(
-    percentile: float,
-) -> str:
-
-    if pd.isna(percentile):
-        return "N/D"
-
-    if percentile >= 0.80:
-        return "MUITO FORTES"
-
-    if percentile >= 0.60:
-        return "FORTES"
-
-    if percentile >= 0.40:
-        return "PRESERVADOS"
-
-    if percentile >= 0.20:
-        return "ENFRAQUECENDO"
-
-    return "FRACOS"
+    return hist.sort_values(["sector", "ticker", "snapshot_date"]).reset_index(drop=True)
 
 
 # ======================================================================================
-# 8. CLASSIFICAÇÃO FINAL
-# ======================================================================================
-
-def classify_entry(
-    signal_percentile: float,
-    sector: str,
-) -> str:
-
-    if pd.isna(
-        signal_percentile
-    ):
-
-        # Na Célula 41:
-        # ausência de informação suficiente -> AGUARDAR
-
-        return "AGUARDAR"
-
-    if (
-        signal_percentile
-        >=
-        ENTRY_STRONG_PERCENTILE
-    ):
-
-        if sector == INDUSTRIALS:
-
-            # Regra condicional:
-            # Industrials nunca recebe ENTRADA FORTE.
-
-            return "ENTRADA"
-
-        return "ENTRADA FORTE"
-
-    if (
-        signal_percentile
-        >=
-        ENTRY_PERCENTILE
-    ):
-
-        return "ENTRADA"
-
-    if (
-        signal_percentile
-        >=
-        WAIT_PERCENTILE
-    ):
-
-        return "AGUARDAR"
-
-    return "NÃO COMPRAR AGORA"
-
-
-# ======================================================================================
-# 9. MOTOR FINAL
+# CLASSIFICAÇÃO ATUAL
 # ======================================================================================
 
 def classify_portfolio_entries(
     portfolio: pd.DataFrame,
     prices: pd.DataFrame,
-    historical_valuation: Optional[pd.DataFrame] = None,
+    fundamentals_history: pd.DataFrame,
+    as_of_date=None,
 ) -> pd.DataFrame:
-    """
-    Recebe as 15 ações JÁ selecionadas.
 
-    Retorna:
-        score
-        percentil
-        classificação
-        prioridade de compra
-    """
+    if portfolio["ticker"].nunique() != 15:
+        raise RuntimeError("entry.py recebeu carteira diferente de 15 ações.")
 
-    required = {
-        "ticker",
-        "sector",
-    }
-
-    if not required.issubset(
-        portfolio.columns
-    ):
-
-        raise ValueError(
-            "Portfolio precisa conter ticker e sector."
-        )
-
-    df = portfolio.copy()
-
-    df[
-        "ticker"
-    ] = (
-        df[
-            "ticker"
-        ]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-        .str.replace(
-            ".",
-            "-",
-            regex=False,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Garantir estrutura 15 / 3 / 5-5-5
-    # ------------------------------------------------------------------
-
-    if (
-        df[
-            "ticker"
-        ]
-        .nunique()
-        !=
-        15
-    ):
-
-        raise RuntimeError(
-            "entry.py recebeu carteira diferente de 15 ações."
-        )
-
-    sector_counts = (
-        df
-        .groupby(
-            "sector"
-        )[
-            "ticker"
-        ]
-        .nunique()
-    )
-
+    counts = portfolio.groupby("sector")["ticker"].nunique()
     for sector in SECTORS:
+        if int(counts.get(sector, 0)) != 5:
+            raise RuntimeError(f"{sector}: estrutura diferente de 5 ações.")
 
-        if (
-            int(
-                sector_counts.get(
-                    sector,
-                    0,
-                )
-            )
-            !=
-            5
-        ):
-
-            raise RuntimeError(
-                f"{sector}: estrutura diferente de 5 ações."
-            )
-
-    # ------------------------------------------------------------------
-    # FUNDAMENTOS
-    # ------------------------------------------------------------------
-
-    df = (
-        calculate_fundamental_preservation(
-            df
-        )
+    history = build_entry_signal_history(
+        portfolio=portfolio,
+        prices=prices,
+        fundamentals_history=fundamentals_history,
+        as_of_date=as_of_date,
     )
 
-    # ------------------------------------------------------------------
-    # DESCONTO
-    # ------------------------------------------------------------------
+    latest_date = history["snapshot_date"].max()
+    current = history[history["snapshot_date"] == latest_date].copy()
 
-    discount = (
-        build_discount_table(
-            portfolio=df,
-            prices=prices,
-        )
-    )
-
-    df = df.merge(
-        discount,
+    # manter metadados de seleção
+    meta_cols = [
+        c for c in [
+            "ticker",
+            "selection_factor",
+            "selection_score",
+            "selection_rank",
+        ]
+        if c in portfolio.columns
+    ]
+    current = current.merge(
+        portfolio[meta_cols].drop_duplicates("ticker"),
         on="ticker",
         how="left",
     )
 
-    # Percentil do desconto dentro do setor
-
-    df[
-        "discount_percentile"
-    ] = (
-        df
-        .groupby(
-            "sector",
-            group_keys=False,
-        )[
-            "discount_score"
-        ]
-        .rank(
-            pct=True,
-            method="average",
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # FUNDAMENTAL PERCENTILE POR SETOR
-    # ------------------------------------------------------------------
-
-    df[
-        "fundamental_percentile"
-    ] = (
-        df
-        .groupby(
-            "sector",
-            group_keys=False,
-        )[
-            "fundamental_score"
-        ]
-        .rank(
-            pct=True,
-            method="average",
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # VALUATION
-    # ------------------------------------------------------------------
-
-    df[
-        "valuation_score"
-    ] = np.nan
-
-    if (
-        historical_valuation is not None
-        and
-        not historical_valuation.empty
-    ):
-
-        valuation_values = []
-
-        for _, row in df.iterrows():
-
-            valuation_values.append(
-                calculate_valuation_score(
-                    current_row=row,
-                    historical_valuation=historical_valuation,
-                )
-            )
-
-        df[
-            "valuation_score"
-        ] = valuation_values
-
-    df[
-        "valuation_percentile"
-    ] = (
-        df
-        .groupby(
-            "sector",
-            group_keys=False,
-        )[
-            "valuation_score"
-        ]
-        .rank(
-            pct=True,
-            method="average",
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # TECHNOLOGY MOMENTUM
-    # ------------------------------------------------------------------
-
-    momentum = (
-        build_technology_momentum(
-            portfolio=df,
-            prices=prices,
-        )
-    )
-
-    if not momentum.empty:
-
-        df = df.merge(
-            momentum,
-            on="ticker",
-            how="left",
-        )
-
-    else:
-
-        df[
-            "momentum_6m"
-        ] = np.nan
-
-        df[
-            "momentum_12m"
-        ] = np.nan
-
-        df[
-            "momentum_score"
-        ] = np.nan
-
-    # ------------------------------------------------------------------
-    # FINAL SIGNAL SCORE
-    # ------------------------------------------------------------------
-
-    df[
-        "final_signal_score"
-    ] = np.nan
-
-    # Health Care
-    #
-    # 10% valuation
-    # 80% desconto
-    # 10% fundamentos
-
-    mask = (
-        df[
-            "sector"
-        ]
-        ==
-        HEALTH_CARE
-    )
-
-    health_components = pd.DataFrame(
-        {
-            "valuation":
-                df.loc[
-                    mask,
-                    "valuation_percentile",
-                ],
-
-            "discount":
-                df.loc[
-                    mask,
-                    "discount_percentile",
-                ],
-
-            "fundamental":
-                df.loc[
-                    mask,
-                    "fundamental_percentile",
-                ],
-        }
-    )
-
-    health_weights = pd.Series(
-        {
-            "valuation":
-                0.10,
-
-            "discount":
-                0.80,
-
-            "fundamental":
-                0.10,
-        }
-    )
-
-    available_weight = (
-        health_components
-        .notna()
-        .mul(
-            health_weights,
-            axis=1,
-        )
-        .sum(
-            axis=1
-        )
-    )
-
-    weighted_sum = (
-        health_components
-        .mul(
-            health_weights,
-            axis=1,
-        )
-        .sum(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-    health_score = (
-        weighted_sum
-        /
-        available_weight.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    df.loc[
-        mask,
-        "final_signal_score",
-    ] = health_score
-
-    # Industrials
-    #
-    # 20% desconto
-    # 80% fundamentos
-
-    mask = (
-        df[
-            "sector"
-        ]
-        ==
-        INDUSTRIALS
-    )
-
-    industrial_components = pd.DataFrame(
-        {
-            "discount":
-                df.loc[
-                    mask,
-                    "discount_percentile",
-                ],
-
-            "fundamental":
-                df.loc[
-                    mask,
-                    "fundamental_percentile",
-                ],
-        }
-    )
-
-    industrial_weights = pd.Series(
-        {
-            "discount":
-                0.20,
-
-            "fundamental":
-                0.80,
-        }
-    )
-
-    available_weight = (
-        industrial_components
-        .notna()
-        .mul(
-            industrial_weights,
-            axis=1,
-        )
-        .sum(
-            axis=1
-        )
-    )
-
-    weighted_sum = (
-        industrial_components
-        .mul(
-            industrial_weights,
-            axis=1,
-        )
-        .sum(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-    industrial_score = (
-        weighted_sum
-        /
-        available_weight.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    df.loc[
-        mask,
-        "final_signal_score",
-    ] = industrial_score
-
-    # Technology
-    #
-    # Momentum 6M + 12M
-
-    mask = (
-        df[
-            "sector"
-        ]
-        ==
-        TECHNOLOGY
-    )
-
-    df.loc[
-        mask,
-        "final_signal_score",
-    ] = df.loc[
-        mask,
-        "momentum_score",
-    ]
-
-    # ------------------------------------------------------------------
-    # SIGNAL PERCENTILE
-    #
-    # Percentil transversal do score dentro do setor.
-    # ------------------------------------------------------------------
-
-    df[
-        "signal_percentile"
-    ] = (
-        df
-        .groupby(
-            "sector",
-            group_keys=False,
-        )[
-            "final_signal_score"
-        ]
-        .rank(
-            pct=True,
-            method="average",
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # STATUS DESCRITIVOS
-    # ------------------------------------------------------------------
-
-    df[
-        "valuation_status"
-    ] = df[
-        "valuation_percentile"
-    ].apply(
-        valuation_status
-    )
-
-    df[
-        "discount_status"
-    ] = df[
-        "discount_percentile"
-    ].apply(
-        discount_status
-    )
-
-    df[
-        "fundamental_status"
-    ] = df[
-        "fundamental_percentile"
-    ].apply(
+    current["selection_status"] = "APROVADA"
+    current["valuation_status"] = current["relative_valuation_score"].map(valuation_status)
+    current["discount_status"] = current["price_discount_score"].map(discount_status)
+    current["fundamental_status"] = current["fundamental_preservation_score"].map(
         fundamental_status
     )
-
-    # ------------------------------------------------------------------
-    # METODOLOGIA / STATUS SETORIAL
-    # ------------------------------------------------------------------
-
-    df[
-        "timing_method"
-    ] = df[
-        "sector"
-    ].map(
-        ENTRY_METHODS
-    )
-
-    df[
-        "sector_validation_status"
-    ] = df[
-        "sector"
-    ].map(
+    current["timing_method"] = current["sector"].map(ENTRY_METHODS)
+    current["sector_validation_status"] = current["sector"].map(
         SECTOR_VALIDATION_STATUS
     )
-
-    # ------------------------------------------------------------------
-    # SINAL FINAL
-    # ------------------------------------------------------------------
-
-    df[
-        "entry_signal"
-    ] = [
-        classify_entry(
-            signal_percentile=pct,
-            sector=sector,
-        )
+    current["entry_signal"] = [
+        classify_entry(pct, sector)
         for pct, sector in zip(
-            df[
-                "signal_percentile"
-            ],
-            df[
-                "sector"
-            ],
+            current["signal_percentile"],
+            current["sector"],
         )
     ]
 
-    # ------------------------------------------------------------------
-    # PRIORIDADE DENTRO DO SETOR
-    # ------------------------------------------------------------------
-
-    df[
-        "buy_priority_sector"
-    ] = (
-        df
-        .groupby(
-            "sector"
-        )[
-            "final_signal_score"
-        ]
-        .rank(
-            method="min",
-            ascending=False,
-        )
+    current["buy_priority_sector"] = (
+        current.groupby("sector")["final_signal_score"]
+        .rank(method="min", ascending=False, na_option="bottom")
     )
 
-    # ------------------------------------------------------------------
-    # STATUS DA SELEÇÃO
-    # ------------------------------------------------------------------
-
-    df[
-        "selection_status"
-    ] = "APROVADA"
-
-    # ------------------------------------------------------------------
-    # ORDEM FINAL
-    # ------------------------------------------------------------------
+    # Salvar histórico para auditoria / futuras comparações
+    history.to_parquet("output/entry_signal_history.parquet", index=False)
 
     signal_order = {
-
-        "ENTRADA FORTE":
-            1,
-
-        "ENTRADA":
-            2,
-
-        "AGUARDAR":
-            3,
-
-        "NÃO COMPRAR AGORA":
-            4,
+        "ENTRADA FORTE": 1,
+        "ENTRADA": 2,
+        "AGUARDAR": 3,
+        "NÃO COMPRAR AGORA": 4,
     }
+    current["_signal_order"] = current["entry_signal"].map(signal_order)
 
-    df[
-        "_signal_order"
-    ] = df[
-        "entry_signal"
-    ].map(
-        signal_order
-    )
-
-    df = (
-        df
+    return (
+        current
         .sort_values(
-            [
-                "_signal_order",
-                "signal_percentile",
-                "final_signal_score",
-            ],
-            ascending=[
-                True,
-                False,
-                False,
-            ],
+            ["_signal_order", "signal_percentile", "final_signal_score"],
+            ascending=[True, False, False],
             na_position="last",
         )
-        .drop(
-            columns=[
-                "_signal_order"
-            ]
-        )
-        .reset_index(
-            drop=True
-        )
+        .drop(columns=["_signal_order"])
+        .reset_index(drop=True)
     )
 
-    return df
 
-
-# ======================================================================================
-# 10. RESUMO EXECUTIVO
-# ======================================================================================
-
-def build_entry_summary(
-    ranking: pd.DataFrame,
-) -> pd.DataFrame:
-
-    columns = [
-
-        "sector",
-        "buy_priority_sector",
-        "ticker",
-        "selection_status",
-        "valuation_status",
-        "discount_status",
-        "fundamental_status",
-        "timing_method",
-        "sector_validation_status",
-        "final_signal_score",
-        "signal_percentile",
-        "entry_signal",
-    ]
-
-    available = [
-        column
-        for column in columns
-        if column in ranking.columns
-    ]
-
-    return ranking[
-        available
-    ].copy()
-
-
-# ======================================================================================
-# 11. AUDITORIA
-# ======================================================================================
-
-def audit_entry_ranking(
-    ranking: pd.DataFrame,
-) -> Dict:
-
-    signals = (
-        ranking[
-            "entry_signal"
-        ]
-        .value_counts()
-        .to_dict()
-    )
-
-    sector_counts = (
-        ranking
-        .groupby(
-            "sector"
-        )[
-            "ticker"
-        ]
-        .nunique()
-        .to_dict()
-    )
+def audit_entry_ranking(ranking: pd.DataFrame) -> Dict:
+    signals = ranking["entry_signal"].value_counts().to_dict()
+    sector_counts = ranking.groupby("sector")["ticker"].nunique().to_dict()
 
     industrial_strong = int(
         (
-            (
-                ranking[
-                    "sector"
-                ]
-                ==
-                INDUSTRIALS
-            )
-            &
-            (
-                ranking[
-                    "entry_signal"
-                ]
-                ==
-                "ENTRADA FORTE"
-            )
+            (ranking["sector"] == INDUSTRIALS)
+            & (ranking["entry_signal"] == "ENTRADA FORTE")
         ).sum()
     )
 
+    structure_ok = (
+        ranking["ticker"].nunique() == 15
+        and all(sector_counts.get(s, 0) == 5 for s in SECTORS)
+        and industrial_strong == 0
+    )
+
     return {
-
-        "number_of_stocks":
-            int(
-                ranking[
-                    "ticker"
-                ].nunique()
-            ),
-
-        "number_of_sectors":
-            int(
-                ranking[
-                    "sector"
-                ].nunique()
-            ),
-
-        "sector_counts":
-            sector_counts,
-
-        "entry_strong":
-            int(
-                signals.get(
-                    "ENTRADA FORTE",
-                    0,
-                )
-            ),
-
-        "entry":
-            int(
-                signals.get(
-                    "ENTRADA",
-                    0,
-                )
-            ),
-
-        "wait":
-            int(
-                signals.get(
-                    "AGUARDAR",
-                    0,
-                )
-            ),
-
-        "do_not_buy":
-            int(
-                signals.get(
-                    "NÃO COMPRAR AGORA",
-                    0,
-                )
-            ),
-
-        "industrial_strong_violation":
-            industrial_strong,
-
-        "structure_ok":
-            (
-                ranking[
-                    "ticker"
-                ].nunique()
-                ==
-                15
-                and
-                all(
-                    sector_counts.get(
-                        sector,
-                        0,
-                    )
-                    ==
-                    5
-                    for sector in SECTORS
-                )
-                and
-                industrial_strong
-                ==
-                0
-            ),
+        "number_of_stocks": int(ranking["ticker"].nunique()),
+        "number_of_sectors": int(ranking["sector"].nunique()),
+        "sector_counts": sector_counts,
+        "entry_strong": int(signals.get("ENTRADA FORTE", 0)),
+        "entry": int(signals.get("ENTRADA", 0)),
+        "wait": int(signals.get("AGUARDAR", 0)),
+        "do_not_buy": int(signals.get("NÃO COMPRAR AGORA", 0)),
+        "industrial_strong_violation": industrial_strong,
+        "structure_ok": bool(structure_ok),
     }
 
 
-# ======================================================================================
-# 12. TESTE DO MÓDULO
-# ======================================================================================
-
 if __name__ == "__main__":
-
-    print(
-        "=" * 100
-    )
-
-    print(
-        "PORTFOLIO ACOES AMERICANO — ENTRY ENGINE"
-    )
-
-    print(
-        "=" * 100
-    )
-
-    print(
-        "\nArquitetura validada:"
-    )
-
-    print(
-        "  Health Care"
-        " -> 10% Valuation + "
-        "80% Desconto + "
-        "10% Fundamentos"
-    )
-
-    print(
-        "  Industrials"
-        " -> 20% Desconto + "
-        "80% Fundamentos"
-        " — CONDICIONAL"
-    )
-
-    print(
-        "  Information Technology"
-        " -> Momentum 6M + 12M"
-    )
-
-    print(
-        "\nClassificações:"
-    )
-
-    print(
-        "  >= 75% -> ENTRADA FORTE"
-    )
-
-    print(
-        "  >= 50% -> ENTRADA"
-    )
-
-    print(
-        "  >= 25% -> AGUARDAR"
-    )
-
-    print(
-        "  <  25% -> NÃO COMPRAR AGORA"
-    )
-
-    print(
-        "\nRestrição:"
-    )
-
-    print(
-        "  Industrials nunca recebe "
-        "ENTRADA FORTE."
-    )
-
-    print(
-        "\nEntry engine carregado com sucesso."
-    )
+    print("ENTRY ENGINE — lógica histórica da Célula 41 carregada.")
