@@ -11,27 +11,48 @@
 #   • 5 Industrials
 #   • 5 Information Technology
 #
-# usando os fatores definidos no estudo:
+# FATORES DEFINITIVOS DO ESTUDO
+# -----------------------------
 #
-#   Health Care              -> Financial Strength
-#   Industrials              -> Growth
-#   Information Technology   -> Quality
+# Health Care
+#   -> Financial Strength
+#      cash_assets ↑
+#      debt_assets ↓
+#      debt_equity ↓
 #
-# IMPORTANTE
-# ----------
-# Os setores e a estrutura 5/5/5 são FIXOS.
-# Os tickers são DINÂMICOS.
+# Industrials
+#   -> Growth
+#      revenue_growth ↑
+#      eps_growth ↑
+#      operating_cash_flow_growth ↑
 #
-# A seleção utiliza score por setor e aplica proteção de fronteira
-# 5º vs 6º para evitar troca excessiva.
+# Information Technology
+#   -> Quality
+#      roa ↑
+#      roe ↑
+#      operating_margin ↑
+#      net_margin ↑
+#
+# METODOLOGIA
+# -----------
+#   1) métricas fundamentais
+#   2) winsorização P5-P95 dentro do setor
+#   3) percentis dentro do setor
+#   4) média dos componentes válidos
+#   5) mínimo de componentes:
+#          Financial Strength = 2/3
+#          Growth             = 2/3
+#          Quality            = 3/4
+#   6) ranking
+#   7) Top 5 por setor
+#   8) proteção de fronteira 5º vs 6º
 #
 # ======================================================================================
-
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,16 +67,62 @@ from config import (
 
 
 # ======================================================================================
-# 1. HELPERS
+# 1. CONFIGURAÇÃO DOS FATORES — CONGELADA PELO ESTUDO
+# ======================================================================================
+
+FACTOR_DEFINITIONS = {
+
+    "financial_strength": {
+
+        "higher": [
+            "cash_assets",
+        ],
+
+        "lower": [
+            "debt_assets",
+            "debt_equity",
+        ],
+
+        "minimum_components": 2,
+    },
+
+    "growth": {
+
+        "higher": [
+            "revenue_growth",
+            "eps_growth",
+            "operating_cash_flow_growth",
+        ],
+
+        "lower": [],
+
+        "minimum_components": 2,
+    },
+
+    "quality": {
+
+        "higher": [
+            "roa",
+            "roe",
+            "operating_margin",
+            "net_margin",
+        ],
+
+        "lower": [],
+
+        "minimum_components": 3,
+    },
+}
+
+
+# ======================================================================================
+# 2. HELPERS
 # ======================================================================================
 
 def safe_divide(
     numerator,
     denominator,
 ):
-    """
-    Divisão segura.
-    """
 
     numerator = pd.to_numeric(
         numerator,
@@ -76,26 +143,47 @@ def safe_divide(
         )
     )
 
-    result = result.replace(
+    return result.replace(
         [np.inf, -np.inf],
         np.nan,
     )
 
-    return result
+
+def winsorize_series(
+    series: pd.Series,
+) -> pd.Series:
+    """
+    Winsorização P5-P95.
+
+    Reproduz a metodologia utilizada no estudo.
+    """
+
+    values = pd.to_numeric(
+        series,
+        errors="coerce",
+    )
+
+    valid = values.dropna()
+
+    if len(valid) < 10:
+        return values
+
+    lower = valid.quantile(0.05)
+    upper = valid.quantile(0.95)
+
+    return values.clip(
+        lower=lower,
+        upper=upper,
+    )
 
 
 def percentile_score(
     series: pd.Series,
-    ascending: bool = True,
+    lower_is_better: bool = False,
 ) -> pd.Series:
     """
-    Converte uma métrica em score percentual 0-1.
-
-    ascending=True:
-        valor maior = score maior
-
-    ascending=False:
-        valor menor = score maior
+    Sempre:
+        score maior = empresa melhor.
     """
 
     values = pd.to_numeric(
@@ -105,13 +193,13 @@ def percentile_score(
 
     return values.rank(
         pct=True,
-        ascending=ascending,
+        ascending=not lower_is_better,
         method="average",
     )
 
 
 # ======================================================================================
-# 2. PREPARAR MÉTRICAS DERIVADAS
+# 3. NORMALIZAÇÃO DAS COLUNAS FUNDAMENTAIS
 # ======================================================================================
 
 def build_derived_metrics(
@@ -120,444 +208,541 @@ def build_derived_metrics(
 
     df = fundamentals.copy()
 
+    # ------------------------------------------------------------------
+    # Normalizar ticker
+    # ------------------------------------------------------------------
+
+    if "ticker" in df.columns:
+
+        df["ticker"] = (
+            df["ticker"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .str.replace(
+                ".",
+                "-",
+                regex=False,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Colunas numéricas possíveis
+    # ------------------------------------------------------------------
 
     numeric_columns = [
+
         "revenue",
         "net_income",
         "operating_income",
         "operating_cash_flow",
-        "capex",
+
         "assets",
         "equity",
         "cash",
-        "long_term_debt",
-        "diluted_eps",
-        "diluted_shares",
-    ]
 
+        "total_debt",
+        "long_term_debt",
+        "short_term_debt",
+
+        "diluted_eps",
+
+        # métricas eventualmente já calculadas
+        "revenue_growth",
+        "eps_growth",
+        "operating_cash_flow_growth",
+
+        "revenue_growth_yoy",
+        "diluted_eps_growth_yoy",
+        "operating_cash_flow_growth_yoy",
+
+        "operating_margin",
+        "net_margin",
+
+        "roa",
+        "roe",
+
+        "cash_assets",
+        "debt_assets",
+        "debt_equity",
+
+        # aliases do arquivo anterior
+        "cash_to_assets",
+        "debt_to_assets",
+        "debt_to_equity",
+    ]
 
     for col in numeric_columns:
 
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            )
+
+    # ------------------------------------------------------------------
+    # Garantir colunas RAW necessárias
+    # ------------------------------------------------------------------
+
+    for col in [
+        "revenue",
+        "net_income",
+        "operating_income",
+        "operating_cash_flow",
+        "assets",
+        "equity",
+        "cash",
+        "total_debt",
+        "long_term_debt",
+        "short_term_debt",
+    ]:
+
         if col not in df.columns:
             df[col] = np.nan
+
+    # ------------------------------------------------------------------
+    # TOTAL DEBT
+    #
+    # Preferência:
+    #   1) total_debt fornecido pela base
+    #   2) short_term_debt + long_term_debt
+    #   3) long_term_debt
+    # ------------------------------------------------------------------
+
+    calculated_total_debt = (
+        df["short_term_debt"].fillna(0)
+        +
+        df["long_term_debt"].fillna(0)
+    )
+
+    no_debt_components = (
+        df["short_term_debt"].isna()
+        &
+        df["long_term_debt"].isna()
+    )
+
+    calculated_total_debt.loc[
+        no_debt_components
+    ] = np.nan
+
+    df["total_debt"] = (
+        df["total_debt"]
+        .combine_first(
+            calculated_total_debt
+        )
+        .combine_first(
+            df["long_term_debt"]
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # MARGENS
+    # ------------------------------------------------------------------
+
+    calculated_operating_margin = safe_divide(
+        df["operating_income"],
+        df["revenue"],
+    )
+
+    calculated_net_margin = safe_divide(
+        df["net_income"],
+        df["revenue"],
+    )
+
+    if "operating_margin" not in df.columns:
+        df["operating_margin"] = calculated_operating_margin
+    else:
+        df["operating_margin"] = (
+            df["operating_margin"]
+            .combine_first(
+                calculated_operating_margin
+            )
+        )
+
+    if "net_margin" not in df.columns:
+        df["net_margin"] = calculated_net_margin
+    else:
+        df["net_margin"] = (
+            df["net_margin"]
+            .combine_first(
+                calculated_net_margin
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # ROA / ROE
+    # ------------------------------------------------------------------
+
+    calculated_roa = safe_divide(
+        df["net_income"],
+        df["assets"],
+    )
+
+    calculated_roe = safe_divide(
+        df["net_income"],
+        df["equity"],
+    )
+
+    if "roa" not in df.columns:
+        df["roa"] = calculated_roa
+    else:
+        df["roa"] = (
+            df["roa"]
+            .combine_first(
+                calculated_roa
+            )
+        )
+
+    if "roe" not in df.columns:
+        df["roe"] = calculated_roe
+    else:
+        df["roe"] = (
+            df["roe"]
+            .combine_first(
+                calculated_roe
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # FINANCIAL STRENGTH
+    # ------------------------------------------------------------------
+
+    calculated_cash_assets = safe_divide(
+        df["cash"],
+        df["assets"],
+    )
+
+    calculated_debt_assets = safe_divide(
+        df["total_debt"],
+        df["assets"],
+    )
+
+    calculated_debt_equity = safe_divide(
+        df["total_debt"],
+        df["equity"],
+    )
+
+    # aliases anteriores, se existirem
+
+    if "cash_assets" not in df.columns:
+        df["cash_assets"] = np.nan
+
+    if "debt_assets" not in df.columns:
+        df["debt_assets"] = np.nan
+
+    if "debt_equity" not in df.columns:
+        df["debt_equity"] = np.nan
+
+    if "cash_to_assets" in df.columns:
+
+        df["cash_assets"] = (
+            df["cash_assets"]
+            .combine_first(
+                df["cash_to_assets"]
+            )
+        )
+
+    if "debt_to_assets" in df.columns:
+
+        df["debt_assets"] = (
+            df["debt_assets"]
+            .combine_first(
+                df["debt_to_assets"]
+            )
+        )
+
+    if "debt_to_equity" in df.columns:
+
+        df["debt_equity"] = (
+            df["debt_equity"]
+            .combine_first(
+                df["debt_to_equity"]
+            )
+        )
+
+    df["cash_assets"] = (
+        df["cash_assets"]
+        .combine_first(
+            calculated_cash_assets
+        )
+    )
+
+    df["debt_assets"] = (
+        df["debt_assets"]
+        .combine_first(
+            calculated_debt_assets
+        )
+    )
+
+    df["debt_equity"] = (
+        df["debt_equity"]
+        .combine_first(
+            calculated_debt_equity
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # GROWTH — aliases
+    # ------------------------------------------------------------------
+
+    if "revenue_growth" not in df.columns:
+        df["revenue_growth"] = np.nan
+
+    if "eps_growth" not in df.columns:
+        df["eps_growth"] = np.nan
+
+    if "operating_cash_flow_growth" not in df.columns:
+        df["operating_cash_flow_growth"] = np.nan
+
+    if "revenue_growth_yoy" in df.columns:
+
+        df["revenue_growth"] = (
+            df["revenue_growth"]
+            .combine_first(
+                df["revenue_growth_yoy"]
+            )
+        )
+
+    if "diluted_eps_growth_yoy" in df.columns:
+
+        df["eps_growth"] = (
+            df["eps_growth"]
+            .combine_first(
+                df["diluted_eps_growth_yoy"]
+            )
+        )
+
+    if "operating_cash_flow_growth_yoy" in df.columns:
+
+        df["operating_cash_flow_growth"] = (
+            df["operating_cash_flow_growth"]
+            .combine_first(
+                df[
+                    "operating_cash_flow_growth_yoy"
+                ]
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Valores infinitos não são elegíveis
+    # ------------------------------------------------------------------
+
+    metric_columns = [
+
+        "cash_assets",
+        "debt_assets",
+        "debt_equity",
+
+        "revenue_growth",
+        "eps_growth",
+        "operating_cash_flow_growth",
+
+        "roa",
+        "roe",
+        "operating_margin",
+        "net_margin",
+    ]
+
+    for col in metric_columns:
 
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce",
         )
 
-
-    # ------------------------------------------------------------------
-    # Free Cash Flow
-    # ------------------------------------------------------------------
-
-    df["free_cash_flow"] = (
-        df["operating_cash_flow"]
-        -
-        df["capex"].abs()
-    )
-
-
-    # ------------------------------------------------------------------
-    # Margens
-    # ------------------------------------------------------------------
-
-    df["net_margin"] = safe_divide(
-        df["net_income"],
-        df["revenue"],
-    )
-
-
-    df["operating_margin"] = safe_divide(
-        df["operating_income"],
-        df["revenue"],
-    )
-
-
-    df["ocf_margin"] = safe_divide(
-        df["operating_cash_flow"],
-        df["revenue"],
-    )
-
-
-    df["fcf_margin"] = safe_divide(
-        df["free_cash_flow"],
-        df["revenue"],
-    )
-
-
-    # ------------------------------------------------------------------
-    # Retornos sobre capital
-    # ------------------------------------------------------------------
-
-    df["roe"] = safe_divide(
-        df["net_income"],
-        df["equity"],
-    )
-
-
-    df["roa"] = safe_divide(
-        df["net_income"],
-        df["assets"],
-    )
-
-
-    # ------------------------------------------------------------------
-    # Dívida
-    # ------------------------------------------------------------------
-
-    df["debt_to_assets"] = safe_divide(
-        df["long_term_debt"],
-        df["assets"],
-    )
-
-
-    df["debt_to_equity"] = safe_divide(
-        df["long_term_debt"],
-        df["equity"],
-    )
-
-
-    # ------------------------------------------------------------------
-    # Caixa relativo
-    # ------------------------------------------------------------------
-
-    df["cash_to_assets"] = safe_divide(
-        df["cash"],
-        df["assets"],
-    )
-
+        df[col] = df[col].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
 
     return df
 
 
 # ======================================================================================
-# 3. GROWTH HISTÓRICO
-# ======================================================================================
-#
-# A seleção diária precisa de crescimento.
-#
-# Para isso, o ideal é receber uma base com pelo menos dois snapshots
-# por empresa:
-#
-#   snapshot atual
-#   snapshot anterior comparável
-#
-# Caso as colunas growth_* já existam, usamos diretamente.
-#
+# 4. SCORE GENÉRICO DE FATOR
 # ======================================================================================
 
-def ensure_growth_metrics(
-    df: pd.DataFrame,
+def calculate_factor_score(
+    sector_df: pd.DataFrame,
+    factor_name: str,
 ) -> pd.DataFrame:
 
-    result = df.copy()
+    if factor_name not in FACTOR_DEFINITIONS:
 
+        raise RuntimeError(
+            f"Fator desconhecido: {factor_name}"
+        )
 
-    growth_columns = [
-        "revenue_growth_yoy",
-        "net_income_growth_yoy",
-        "operating_cash_flow_growth_yoy",
-        "diluted_eps_growth_yoy",
+    df = sector_df.copy()
+
+    definition = FACTOR_DEFINITIONS[
+        factor_name
     ]
 
+    higher_metrics = definition[
+        "higher"
+    ]
 
-    for col in growth_columns:
+    lower_metrics = definition[
+        "lower"
+    ]
 
-        if col not in result.columns:
-            result[col] = np.nan
+    all_metrics = (
+        higher_metrics
+        +
+        lower_metrics
+    )
 
+    # ------------------------------------------------------------------
+    # Validar / criar métricas ausentes
+    # ------------------------------------------------------------------
 
-    return result
+    for metric in all_metrics:
+
+        if metric not in df.columns:
+            df[metric] = np.nan
+
+    # ------------------------------------------------------------------
+    # Winsorização P5-P95
+    #
+    # A função recebe somente um setor.
+    # Portanto a winsorização ocorre dentro do setor.
+    # ------------------------------------------------------------------
+
+    winsorized = pd.DataFrame(
+        index=df.index
+    )
+
+    for metric in all_metrics:
+
+        winsorized[
+            metric
+        ] = winsorize_series(
+            df[metric]
+        )
+
+    # ------------------------------------------------------------------
+    # Percentis
+    # ------------------------------------------------------------------
+
+    components = pd.DataFrame(
+        index=df.index
+    )
+
+    for metric in higher_metrics:
+
+        components[
+            metric
+        ] = percentile_score(
+            winsorized[metric],
+            lower_is_better=False,
+        )
+
+    for metric in lower_metrics:
+
+        components[
+            metric
+        ] = percentile_score(
+            winsorized[metric],
+            lower_is_better=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Número de componentes disponíveis
+    # ------------------------------------------------------------------
+
+    components_column = (
+        f"{factor_name}_components"
+    )
+
+    score_column = (
+        f"{factor_name}_score"
+    )
+
+    df[
+        components_column
+    ] = (
+        components
+        .notna()
+        .sum(axis=1)
+    )
+
+    # ------------------------------------------------------------------
+    # SCORE DEFINITIVO
+    #
+    # Média dos percentis válidos.
+    # NÃO mediana.
+    # ------------------------------------------------------------------
+
+    df[
+        score_column
+    ] = (
+        components
+        .mean(
+            axis=1,
+            skipna=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Mínimo de componentes
+    # ------------------------------------------------------------------
+
+    minimum_components = int(
+        definition[
+            "minimum_components"
+        ]
+    )
+
+    df.loc[
+        df[
+            components_column
+        ]
+        <
+        minimum_components,
+        score_column,
+    ] = np.nan
+
+    return df
 
 
 # ======================================================================================
-# 4. FINANCIAL STRENGTH SCORE — HEALTH CARE
-# ======================================================================================
-#
-# Estrutura:
-#
-#   ROE
-#   ROA
-#   Margem operacional
-#   Margem líquida
-#   OCF margin
-#   FCF margin
-#   Caixa / ativos
-#   Dívida / ativos (menor é melhor)
-#
-# Score final = mediana dos componentes válidos.
-#
+# 5. WRAPPERS DOS TRÊS FATORES
 # ======================================================================================
 
 def calculate_financial_strength_score(
     sector_df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    df = sector_df.copy()
-
-
-    components = pd.DataFrame(
-        index=df.index
+    return calculate_factor_score(
+        sector_df,
+        "financial_strength",
     )
 
-
-    components["roe"] = percentile_score(
-        df["roe"],
-        ascending=True,
-    )
-
-
-    components["roa"] = percentile_score(
-        df["roa"],
-        ascending=True,
-    )
-
-
-    components["operating_margin"] = percentile_score(
-        df["operating_margin"],
-        ascending=True,
-    )
-
-
-    components["net_margin"] = percentile_score(
-        df["net_margin"],
-        ascending=True,
-    )
-
-
-    components["ocf_margin"] = percentile_score(
-        df["ocf_margin"],
-        ascending=True,
-    )
-
-
-    components["fcf_margin"] = percentile_score(
-        df["fcf_margin"],
-        ascending=True,
-    )
-
-
-    components["cash_to_assets"] = percentile_score(
-        df["cash_to_assets"],
-        ascending=True,
-    )
-
-
-    components["debt_to_assets"] = percentile_score(
-        df["debt_to_assets"],
-        ascending=False,
-    )
-
-
-    df["financial_strength_components"] = (
-        components
-        .notna()
-        .sum(axis=1)
-    )
-
-
-    df["financial_strength_score"] = (
-        components
-        .median(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-
-    df.loc[
-        df["financial_strength_components"] < 4,
-        "financial_strength_score"
-    ] = np.nan
-
-
-    return df
-
-
-# ======================================================================================
-# 5. GROWTH SCORE — INDUSTRIALS
-# ======================================================================================
-#
-# Componentes:
-#
-#   Revenue Growth
-#   Net Income Growth
-#   Operating Cash Flow Growth
-#   EPS Growth
-#   Margem operacional
-#
-# ======================================================================================
 
 def calculate_growth_score(
     sector_df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    df = sector_df.copy()
-
-
-    df = ensure_growth_metrics(
-        df
+    return calculate_factor_score(
+        sector_df,
+        "growth",
     )
 
-
-    components = pd.DataFrame(
-        index=df.index
-    )
-
-
-    components["revenue_growth"] = percentile_score(
-        df["revenue_growth_yoy"],
-        ascending=True,
-    )
-
-
-    components["net_income_growth"] = percentile_score(
-        df["net_income_growth_yoy"],
-        ascending=True,
-    )
-
-
-    components["ocf_growth"] = percentile_score(
-        df["operating_cash_flow_growth_yoy"],
-        ascending=True,
-    )
-
-
-    components["eps_growth"] = percentile_score(
-        df["diluted_eps_growth_yoy"],
-        ascending=True,
-    )
-
-
-    components["operating_margin"] = percentile_score(
-        df["operating_margin"],
-        ascending=True,
-    )
-
-
-    df["growth_components"] = (
-        components
-        .notna()
-        .sum(axis=1)
-    )
-
-
-    df["growth_score"] = (
-        components
-        .median(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-
-    df.loc[
-        df["growth_components"] < 3,
-        "growth_score"
-    ] = np.nan
-
-
-    return df
-
-
-# ======================================================================================
-# 6. QUALITY SCORE — INFORMATION TECHNOLOGY
-# ======================================================================================
-#
-# Componentes:
-#
-#   ROE
-#   ROA
-#   Margem operacional
-#   Margem líquida
-#   OCF margin
-#   FCF margin
-#   Dívida / ativos (menor melhor)
-#
-# ======================================================================================
 
 def calculate_quality_score(
     sector_df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    df = sector_df.copy()
-
-
-    components = pd.DataFrame(
-        index=df.index
+    return calculate_factor_score(
+        sector_df,
+        "quality",
     )
-
-
-    components["roe"] = percentile_score(
-        df["roe"],
-        ascending=True,
-    )
-
-
-    components["roa"] = percentile_score(
-        df["roa"],
-        ascending=True,
-    )
-
-
-    components["operating_margin"] = percentile_score(
-        df["operating_margin"],
-        ascending=True,
-    )
-
-
-    components["net_margin"] = percentile_score(
-        df["net_margin"],
-        ascending=True,
-    )
-
-
-    components["ocf_margin"] = percentile_score(
-        df["ocf_margin"],
-        ascending=True,
-    )
-
-
-    components["fcf_margin"] = percentile_score(
-        df["fcf_margin"],
-        ascending=True,
-    )
-
-
-    components["debt_to_assets"] = percentile_score(
-        df["debt_to_assets"],
-        ascending=False,
-    )
-
-
-    df["quality_components"] = (
-        components
-        .notna()
-        .sum(axis=1)
-    )
-
-
-    df["quality_score"] = (
-        components
-        .median(
-            axis=1,
-            skipna=True,
-        )
-    )
-
-
-    df.loc[
-        df["quality_components"] < 4,
-        "quality_score"
-    ] = np.nan
-
-
-    return df
 
 
 # ======================================================================================
-# 7. CALCULAR SCORE POR SETOR
+# 6. CALCULAR SCORE POR SETOR
 # ======================================================================================
 
 def score_sector(
@@ -568,7 +753,6 @@ def score_sector(
     factor = SELECTION_FACTORS[
         sector
     ]
-
 
     if factor == "financial_strength":
 
@@ -582,7 +766,6 @@ def score_sector(
             "financial_strength_score"
         )
 
-
     elif factor == "growth":
 
         scored = (
@@ -594,7 +777,6 @@ def score_sector(
         score_column = (
             "growth_score"
         )
-
 
     elif factor == "quality":
 
@@ -608,13 +790,11 @@ def score_sector(
             "quality_score"
         )
 
-
     else:
 
         raise RuntimeError(
             f"Fator desconhecido: {factor}"
         )
-
 
     return (
         scored,
@@ -623,7 +803,7 @@ def score_sector(
 
 
 # ======================================================================================
-# 8. CARREGAR CARTEIRA ANTERIOR
+# 7. CARREGAR CARTEIRA ANTERIOR
 # ======================================================================================
 
 def load_previous_portfolio() -> pd.DataFrame:
@@ -632,18 +812,15 @@ def load_previous_portfolio() -> pd.DataFrame:
         CURRENT_PORTFOLIO_FILE
     )
 
-
     if not path.exists():
 
         return pd.DataFrame()
-
 
     try:
 
         df = pd.read_csv(
             path
         )
-
 
         if (
             "ticker"
@@ -655,17 +832,19 @@ def load_previous_portfolio() -> pd.DataFrame:
 
             return pd.DataFrame()
 
-
         df["ticker"] = (
             df["ticker"]
             .astype(str)
             .str.upper()
             .str.strip()
+            .str.replace(
+                ".",
+                "-",
+                regex=False,
+            )
         )
 
-
         return df
-
 
     except Exception:
 
@@ -673,16 +852,7 @@ def load_previous_portfolio() -> pd.DataFrame:
 
 
 # ======================================================================================
-# 9. REGRA DE FRONTEIRA 5º VS 6º
-# ======================================================================================
-#
-# Se houver carteira anterior:
-#
-#   • a 6ª colocada não substitui automaticamente a 5ª;
-#   • só troca se a vantagem relativa for >= FRONTIER_MIN_RELATIVE_GAP.
-#
-# Isso reduz turnover.
-#
+# 8. REGRA DE FRONTEIRA 5º VS 6º
 # ======================================================================================
 
 def apply_frontier_rule(
@@ -696,7 +866,6 @@ def apply_frontier_rule(
         sector
     ]
 
-
     ranked = (
         ranked
         .sort_values(
@@ -707,20 +876,17 @@ def apply_frontier_rule(
         .copy()
     )
 
-
     if len(ranked) <= target:
 
         return ranked.head(
             target
         )
 
-
     preliminary = (
         ranked
         .head(target)
         .copy()
     )
-
 
     if (
         previous_portfolio is None
@@ -729,7 +895,6 @@ def apply_frontier_rule(
     ):
 
         return preliminary
-
 
     previous_sector = (
         previous_portfolio[
@@ -741,7 +906,6 @@ def apply_frontier_rule(
         ]
     )
 
-
     previous_tickers = set(
         previous_sector[
             "ticker"
@@ -751,31 +915,25 @@ def apply_frontier_rule(
         .str.strip()
     )
 
-
     if not previous_tickers:
 
         return preliminary
-
 
     rank5 = ranked.iloc[
         target - 1
     ]
 
-
     rank6 = ranked.iloc[
         target
     ]
-
 
     ticker5 = str(
         rank5["ticker"]
     )
 
-
     ticker6 = str(
         rank6["ticker"]
     )
-
 
     score5 = float(
         rank5[
@@ -783,32 +941,25 @@ def apply_frontier_rule(
         ]
     )
 
-
     score6 = float(
         rank6[
             score_column
         ]
     )
 
-
     # ------------------------------------------------------------------
-    # Só existe questão de fronteira se:
+    # Proteção de fronteira:
     #
-    #   • 5º é novo
-    #   • 6º fazia parte da carteira anterior
-    #
+    # 5º = novo candidato
+    # 6º = incumbente da carteira anterior
     # ------------------------------------------------------------------
 
     if (
         ticker5
-        not in
-        previous_tickers
-
+        not in previous_tickers
         and
-
         ticker6
-        in
-        previous_tickers
+        in previous_tickers
     ):
 
         denominator = max(
@@ -816,13 +967,11 @@ def apply_frontier_rule(
             1e-9,
         )
 
-
         relative_gap = (
             score5
             -
             score6
         ) / denominator
-
 
         if (
             relative_gap
@@ -830,7 +979,6 @@ def apply_frontier_rule(
             FRONTIER_MIN_RELATIVE_GAP
         ):
 
-            # manter incumbente
             preliminary = (
                 ranked
                 .head(
@@ -838,7 +986,6 @@ def apply_frontier_rule(
                 )
                 .copy()
             )
-
 
             incumbent = (
                 ranked[
@@ -851,7 +998,6 @@ def apply_frontier_rule(
                 .head(1)
             )
 
-
             preliminary = pd.concat(
                 [
                     preliminary,
@@ -860,12 +1006,11 @@ def apply_frontier_rule(
                 ignore_index=True,
             )
 
-
     return preliminary
 
 
 # ======================================================================================
-# 10. SELECIONAR TOP 5 DO SETOR
+# 9. SELECIONAR TOP 5 DO SETOR
 # ======================================================================================
 
 def select_sector(
@@ -885,13 +1030,11 @@ def select_sector(
         .copy()
     )
 
-
     if sector_df.empty:
 
         raise RuntimeError(
             f"Nenhuma empresa disponível em {sector}"
         )
-
 
     scored, score_column = (
         score_sector(
@@ -900,29 +1043,27 @@ def select_sector(
         )
     )
 
-
-    scored = scored[
+    scored = (
         scored[
-            score_column
+            scored[
+                score_column
+            ]
+            .notna()
         ]
-        .notna()
-    ].copy()
+        .copy()
+    )
 
+    target = SECTOR_TARGETS[
+        sector
+    ]
 
-    if (
-        len(scored)
-        <
-        SECTOR_TARGETS[
-            sector
-        ]
-    ):
+    if len(scored) < target:
 
         raise RuntimeError(
             f"{sector}: apenas {len(scored)} "
             f"empresas elegíveis para "
-            f"{SECTOR_TARGETS[sector]} posições."
+            f"{target} posições."
         )
-
 
     scored = (
         scored
@@ -933,14 +1074,12 @@ def select_sector(
         .reset_index(drop=True)
     )
 
-
-    scored["raw_rank"] = (
-        np.arange(
-            1,
-            len(scored) + 1,
-        )
+    scored[
+        "raw_rank"
+    ] = np.arange(
+        1,
+        len(scored) + 1,
     )
-
 
     selected = apply_frontier_rule(
         ranked=scored,
@@ -949,40 +1088,44 @@ def select_sector(
         previous_portfolio=previous_portfolio,
     )
 
+    selected = (
+        selected
+        .copy()
+        .reset_index(drop=True)
+    )
 
-    selected = selected.copy()
-
-
-    selected["selection_factor"] = (
+    selected[
+        "selection_factor"
+    ] = (
         SELECTION_FACTORS[
             sector
         ]
     )
 
-
-    selected["selection_score"] = (
+    selected[
+        "selection_score"
+    ] = (
         selected[
             score_column
         ]
     )
 
-
-    selected["selection_rank"] = (
-        np.arange(
-            1,
-            len(selected) + 1,
-        )
+    selected[
+        "selection_rank"
+    ] = np.arange(
+        1,
+        len(selected) + 1,
     )
 
-
-    selected["selected"] = True
-
+    selected[
+        "selected"
+    ] = True
 
     return selected
 
 
 # ======================================================================================
-# 11. SELEÇÃO FINAL 15 AÇÕES
+# 10. SELEÇÃO FINAL DAS 15 AÇÕES
 # ======================================================================================
 
 def select_portfolio(
@@ -995,7 +1138,6 @@ def select_portfolio(
         "sector",
     }
 
-
     if not required_columns.issubset(
         universe.columns
     ):
@@ -1004,24 +1146,11 @@ def select_portfolio(
             "Universo precisa conter ticker e sector."
         )
 
-
-    # ------------------------------------------------------------------
-    # Métricas derivadas
-    # ------------------------------------------------------------------
-
-    universe = build_derived_metrics(
-        universe
+    universe = (
+        build_derived_metrics(
+            universe
+        )
     )
-
-
-    universe = ensure_growth_metrics(
-        universe
-    )
-
-
-    # ------------------------------------------------------------------
-    # Carteira anterior
-    # ------------------------------------------------------------------
 
     previous = (
         load_previous_portfolio()
@@ -1029,35 +1158,29 @@ def select_portfolio(
         else pd.DataFrame()
     )
 
-
     selected_parts = []
-
 
     for sector in SECTORS:
 
-        selected_sector = select_sector(
-
-            universe=universe,
-
-            sector=sector,
-
-            previous_portfolio=previous,
+        selected_sector = (
+            select_sector(
+                universe=universe,
+                sector=sector,
+                previous_portfolio=previous,
+            )
         )
-
 
         selected_parts.append(
             selected_sector
         )
-
 
     portfolio = pd.concat(
         selected_parts,
         ignore_index=True,
     )
 
-
     # ------------------------------------------------------------------
-    # Auditoria estrutural
+    # AUDITORIA — exatamente 15 tickers
     # ------------------------------------------------------------------
 
     if (
@@ -1073,6 +1196,9 @@ def select_portfolio(
             "A carteira final não possui exatamente 15 tickers."
         )
 
+    # ------------------------------------------------------------------
+    # AUDITORIA — exatamente 5 por setor
+    # ------------------------------------------------------------------
 
     sector_counts = (
         portfolio
@@ -1084,7 +1210,6 @@ def select_portfolio(
         .nunique()
     )
 
-
     for sector in SECTORS:
 
         expected = (
@@ -1093,7 +1218,6 @@ def select_portfolio(
             ]
         )
 
-
         actual = int(
             sector_counts.get(
                 sector,
@@ -1101,18 +1225,12 @@ def select_portfolio(
             )
         )
 
-
         if actual != expected:
 
             raise RuntimeError(
                 f"{sector}: {actual} ações. "
                 f"Esperado: {expected}."
             )
-
-
-    # ------------------------------------------------------------------
-    # Ordem final
-    # ------------------------------------------------------------------
 
     portfolio = (
         portfolio
@@ -1125,30 +1243,24 @@ def select_portfolio(
         .reset_index(drop=True)
     )
 
-
     return portfolio
 
 
 # ======================================================================================
-# 12. AUDITORIA DA FRONTEIRA
+# 11. AUDITORIA DA FRONTEIRA
 # ======================================================================================
 
 def build_frontier_audit(
     universe: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    universe = build_derived_metrics(
-        universe
+    universe = (
+        build_derived_metrics(
+            universe
+        )
     )
-
-
-    universe = ensure_growth_metrics(
-        universe
-    )
-
 
     rows = []
-
 
     for sector in SECTORS:
 
@@ -1163,14 +1275,12 @@ def build_frontier_audit(
             .copy()
         )
 
-
         scored, score_column = (
             score_sector(
                 sector_df,
                 sector,
             )
         )
-
 
         scored = (
             scored[
@@ -1186,14 +1296,11 @@ def build_frontier_audit(
             .reset_index(drop=True)
         )
 
-
         if len(scored) < 6:
             continue
 
-
         rank5 = scored.iloc[4]
         rank6 = scored.iloc[5]
-
 
         score5 = float(
             rank5[
@@ -1201,13 +1308,11 @@ def build_frontier_audit(
             ]
         )
 
-
         score6 = float(
             rank6[
                 score_column
             ]
         )
-
 
         relative_gap = (
             (
@@ -1221,7 +1326,6 @@ def build_frontier_audit(
                 1e-9,
             )
         )
-
 
         rows.append(
             {
@@ -1261,14 +1365,13 @@ def build_frontier_audit(
             }
         )
 
-
     return pd.DataFrame(
         rows
     )
 
 
 # ======================================================================================
-# 13. TESTE DO MÓDULO
+# 12. TESTE DO MÓDULO
 # ======================================================================================
 
 if __name__ == "__main__":
@@ -1285,11 +1388,25 @@ if __name__ == "__main__":
         "=" * 100
     )
 
+    print(
+        "\nMetodologia:"
+    )
+
+    print(
+        "  Winsorização P5-P95"
+    )
+
+    print(
+        "  Percentis dentro do setor"
+    )
+
+    print(
+        "  Score = média dos componentes"
+    )
 
     print(
         "\nFatores congelados:"
     )
-
 
     for sector in SECTORS:
 
@@ -1297,7 +1414,6 @@ if __name__ == "__main__":
             f"  {sector:<28} -> "
             f"{SELECTION_FACTORS[sector]}"
         )
-
 
     print(
         "\nEstrutura:"
@@ -1309,6 +1425,10 @@ if __name__ == "__main__":
 
     print(
         "  5 ações por setor"
+    )
+
+    print(
+        "  15 ações totais"
     )
 
     print(
