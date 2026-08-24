@@ -985,287 +985,178 @@ def get_company_facts(
 SEC_CONCEPTS = {
 
     "revenue": [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet",
-        "Revenues",
+        ("RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
+        ("Revenues", "USD"),
+        ("SalesRevenueNet", "USD"),
     ],
 
     "net_income": [
-        "NetIncomeLoss",
-        "ProfitLoss",
+        ("NetIncomeLoss", "USD"),
+        ("ProfitLoss", "USD"),
     ],
 
     "operating_income": [
-        "OperatingIncomeLoss",
+        ("OperatingIncomeLoss", "USD"),
     ],
 
     "operating_cash_flow": [
-        "NetCashProvidedByUsedInOperatingActivities",
+        ("NetCashProvidedByUsedInOperatingActivities", "USD"),
     ],
 
     "capex": [
-        "PaymentsToAcquirePropertyPlantAndEquipment",
-        "PaymentsForAdditionsToPropertyPlantAndEquipment",
+        ("PaymentsToAcquirePropertyPlantAndEquipment", "USD"),
+        ("PaymentsToAcquireProductiveAssets", "USD"),
     ],
 
     "assets": [
-        "Assets",
+        ("Assets", "USD"),
     ],
 
     "equity": [
-        "StockholdersEquity",
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ("StockholdersEquity", "USD"),
+        (
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "USD",
+        ),
     ],
 
     "cash": [
-        "CashAndCashEquivalentsAtCarryingValue",
-        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ("CashAndCashEquivalentsAtCarryingValue", "USD"),
+        (
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "USD",
+        ),
     ],
 
-    # ------------------------------------------------------------------
-    # Dívida
-    # ------------------------------------------------------------------
-
     "long_term_debt": [
-        "LongTermDebtNoncurrent",
-        "LongTermDebt",
+        ("LongTermDebtNoncurrent", "USD"),
+        ("LongTermDebt", "USD"),
     ],
 
     "short_term_debt": [
-        "ShortTermBorrowings",
-        "ShortTermDebtCurrent",
-        "LongTermDebtCurrent",
-        "CurrentPortionOfLongTermDebt",
+        ("ShortTermBorrowings", "USD"),
+        ("ShortTermDebtCurrent", "USD"),
+        ("LongTermDebtCurrent", "USD"),
+        ("CurrentPortionOfLongTermDebt", "USD"),
     ],
 
-    # ------------------------------------------------------------------
-    # EPS
-    # ------------------------------------------------------------------
-
     "diluted_eps": [
-        "EarningsPerShareDiluted",
+        ("EarningsPerShareDiluted", "USD/shares"),
     ],
 
     "diluted_shares": [
-        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        ("WeightedAverageNumberOfDilutedSharesOutstanding", "shares"),
     ],
 }
 
 
 # ======================================================================================
-# 11. LOCALIZAR CONCEITO SEC
-# ======================================================================================
-
-def find_sec_concept(
-    company_facts: Dict,
-    concept_names: Iterable[str],
-):
-
-    facts = (
-        company_facts
-        .get(
-            "facts",
-            {}
-        )
-        .get(
-            "us-gaap",
-            {}
-        )
-    )
-
-    for concept in concept_names:
-
-        if concept in facts:
-
-            return (
-                concept,
-                facts[
-                    concept
-                ],
-            )
-
-    return (
-        None,
-        None,
-    )
-
-
-# ======================================================================================
-# 12. EXTRAIR OBSERVAÇÕES
+# 11. EXTRAIR TODAS AS TAGS — FIDELIDADE À CÉLULA 33B
 # ======================================================================================
 
 def extract_concept_observations(
     company_facts: Dict,
-    concept_names: Iterable[str],
+    concept_names: Iterable,
     ticker: str,
     metric_name: str,
 ) -> pd.DataFrame:
 
-    concept, fact = (
-        find_sec_concept(
-            company_facts,
-            concept_names,
-        )
-    )
-
-    if fact is None:
-
-        return pd.DataFrame()
-
-    units = fact.get(
-        "units",
-        {}
+    us_gaap = (
+        company_facts
+        .get("facts", {})
+        .get("us-gaap", {})
     )
 
     rows = []
 
-    for (
-        unit_name,
-        observations
-    ) in units.items():
+    for priority, spec in enumerate(concept_names):
 
-        for obs in observations:
+        if isinstance(spec, (tuple, list)) and len(spec) == 2:
+            tag, expected_unit = spec
+        else:
+            tag = str(spec)
+            expected_unit = None
 
-            value = safe_numeric(
-                obs.get(
-                    "val"
-                )
-            )
+        tag_data = us_gaap.get(tag)
 
-            filed = pd.to_datetime(
-                obs.get(
-                    "filed"
-                ),
-                errors="coerce",
-            )
+        if tag_data is None:
+            continue
 
-            end = pd.to_datetime(
-                obs.get(
-                    "end"
-                ),
-                errors="coerce",
-            )
+        units = tag_data.get("units", {})
 
-            start = pd.to_datetime(
-                obs.get(
-                    "start"
-                ),
-                errors="coerce",
-            )
+        if expected_unit is not None:
+            unit_items = [(expected_unit, units.get(expected_unit))]
+        else:
+            unit_items = list(units.items())
 
-            if (
-                pd.isna(filed)
-                or
-                pd.isna(end)
-                or
-                pd.isna(value)
-            ):
+        for unit_name, observations in unit_items:
+
+            if observations is None:
                 continue
 
-            rows.append(
-                {
-                    "ticker":
-                        normalize_ticker(
-                            ticker
-                        ),
+            for obs in observations:
 
-                    "metric":
-                        metric_name,
+                value = safe_numeric(obs.get("val"))
+                filed = pd.to_datetime(obs.get("filed"), errors="coerce")
+                end = pd.to_datetime(obs.get("end"), errors="coerce")
+                start = pd.to_datetime(obs.get("start"), errors="coerce")
 
-                    "concept":
-                        concept,
+                if pd.isna(filed) or pd.isna(end) or pd.isna(value):
+                    continue
 
-                    "unit":
-                        unit_name,
-
-                    "value":
-                        value,
-
-                    "start":
-                        start,
-
-                    "end":
-                        end,
-
-                    "filed":
-                        filed,
-
-                    "form":
-                        obs.get(
-                            "form"
-                        ),
-
-                    "fy":
-                        obs.get(
-                            "fy"
-                        ),
-
-                    "fp":
-                        obs.get(
-                            "fp"
-                        ),
-
-                    "accn":
-                        obs.get(
-                            "accn"
-                        ),
-                }
-            )
+                rows.append(
+                    {
+                        "ticker": normalize_ticker(ticker),
+                        "metric": metric_name,
+                        "concept": tag,
+                        "tag": tag,
+                        "priority": int(priority),
+                        "taxonomy": "us-gaap",
+                        "unit": unit_name,
+                        "value": value,
+                        "start": start,
+                        "end": end,
+                        "filed": filed,
+                        "available_date": filed,
+                        "form": obs.get("form"),
+                        "fy": obs.get("fy"),
+                        "fp": obs.get("fp"),
+                        "accn": obs.get("accn"),
+                    }
+                )
 
     if not rows:
-
         return pd.DataFrame()
 
-    df = pd.DataFrame(
-        rows
-    )
+    df = pd.DataFrame(rows)
 
-    df = df[
-        df[
-            "form"
-        ].isin(
-            [
-                "10-K",
-                "10-Q",
-                "10-K/A",
-                "10-Q/A",
-            ]
-        )
-    ].copy()
+    valid_forms = {
+        "10-K", "10-K/A",
+        "10-Q", "10-Q/A",
+        "20-F", "20-F/A",
+        "40-F", "40-F/A",
+    }
 
-    # ------------------------------------------------------------------
-    # POINT-IN-TIME
-    #
-    # O mercado somente conhece o dado depois do FILED.
-    # ------------------------------------------------------------------
-
-    df[
-        "available_date"
-    ] = df[
-        "filed"
-    ]
+    df = df[df["form"].isin(valid_forms)].copy()
 
     df = (
         df
         .sort_values(
-            [
-                "available_date",
-                "end",
-            ]
+            ["available_date", "end", "priority"],
+            ascending=[True, True, True],
         )
         .drop_duplicates(
             subset=[
                 "ticker",
                 "metric",
+                "tag",
                 "end",
                 "filed",
                 "value",
             ],
             keep="last",
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
     return df
