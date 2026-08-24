@@ -257,33 +257,345 @@ def _build_daily_price_indicators(prices: pd.DataFrame, tickers: list[str]) -> p
 # FUNDAMENTOS POINT-IN-TIME
 # ======================================================================================
 
-def _prepare_facts(fundamentals_history: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    required = {"ticker", "metric", "value", "available_date", "end"}
-    if fundamentals_history is None or fundamentals_history.empty:
-        raise RuntimeError("Histórico fundamental vazio.")
-    if not required.issubset(fundamentals_history.columns):
+def _prepare_facts(
+    fundamentals_history: pd.DataFrame,
+    tickers: list[str],
+) -> pd.DataFrame:
+    """
+    Prepara os fatos SEC exatamente na arquitetura usada pela Célula 33B.
+
+    REGRA DO ESTUDO
+    ---------------
+    Fluxos:
+        revenue
+        net_income
+        operating_cash_flow
+        capex
+        diluted_eps
+        diluted_shares
+
+    usam somente demonstrações ANUAIS:
+        10-K / 10-K/A
+        20-F / 20-F/A
+        40-F / 40-F/A
+
+    e, quando START existe, duração entre 250 e 450 dias.
+
+    Estoques/instantâneos podem usar:
+        10-K / 10-K/A
+        10-Q / 10-Q/A
+        20-F / 20-F/A
+        40-F / 40-F/A
+
+    Isso é importante porque a Célula 37 recebeu a base corrigida da
+    Célula 33B. Portanto, misturar trimestre/YTD com anual altera os
+    crescimentos, margens, percentis e principalmente Industrials.
+
+    Nenhum peso ou regra de entrada é alterado aqui.
+    """
+
+    required = {
+        "ticker",
+        "metric",
+        "value",
+        "available_date",
+        "end",
+    }
+
+    if (
+        fundamentals_history is None
+        or
+        fundamentals_history.empty
+    ):
         raise RuntimeError(
-            f"Histórico fundamental precisa conter: {sorted(required)}"
+            "Histórico fundamental vazio."
+        )
+
+    if not required.issubset(
+        fundamentals_history.columns
+    ):
+        raise RuntimeError(
+            "Histórico fundamental precisa conter: "
+            f"{sorted(required)}"
         )
 
     facts = fundamentals_history.copy()
-    facts["ticker"] = facts["ticker"].astype(str).str.upper().str.strip()
-    facts = facts[facts["ticker"].isin(tickers)].copy()
-    facts["available_date"] = pd.to_datetime(facts["available_date"], errors="coerce")
-    facts["end"] = pd.to_datetime(facts["end"], errors="coerce")
-    facts["value"] = pd.to_numeric(facts["value"], errors="coerce")
-    facts = facts.dropna(subset=["ticker", "metric", "value", "available_date", "end"])
-    return facts.sort_values(["ticker", "metric", "available_date", "end"])
 
+    facts["ticker"] = (
+        facts["ticker"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
 
-def _latest_metric(history: pd.DataFrame, metric: str, snapshot: pd.Timestamp):
-    temp = history[
-        (history["metric"] == metric)
-        & (history["available_date"] <= snapshot)
+    facts = facts[
+        facts["ticker"].isin(
+            tickers
+        )
+    ].copy()
+
+    facts["available_date"] = pd.to_datetime(
+        facts["available_date"],
+        errors="coerce",
+    )
+
+    facts["end"] = pd.to_datetime(
+        facts["end"],
+        errors="coerce",
+    )
+
+    if "filed" in facts.columns:
+
+        facts["filed"] = pd.to_datetime(
+            facts["filed"],
+            errors="coerce",
+        )
+
+    else:
+
+        # data.py define available_date = filed.
+        facts["filed"] = facts[
+            "available_date"
+        ]
+
+    if "start" in facts.columns:
+
+        facts["start"] = pd.to_datetime(
+            facts["start"],
+            errors="coerce",
+        )
+
+    else:
+
+        facts["start"] = pd.NaT
+
+    facts["value"] = pd.to_numeric(
+        facts["value"],
+        errors="coerce",
+    )
+
+    facts = facts.dropna(
+        subset=[
+            "ticker",
+            "metric",
+            "value",
+            "available_date",
+            "end",
+        ]
+    ).copy()
+
+    # ------------------------------------------------------------------
+    # MESMAS FAMÍLIAS DA CÉLULA 33B
+    # ------------------------------------------------------------------
+
+    flow_metrics = {
+        "revenue",
+        "net_income",
+        "operating_cash_flow",
+        "capex",
+        "diluted_eps",
+        "diluted_shares",
+    }
+
+    annual_forms = {
+        "10-K",
+        "10-K/A",
+        "20-F",
+        "20-F/A",
+        "40-F",
+        "40-F/A",
+    }
+
+    instant_forms = {
+        "10-K",
+        "10-K/A",
+        "10-Q",
+        "10-Q/A",
+        "20-F",
+        "20-F/A",
+        "40-F",
+        "40-F/A",
+    }
+
+    if "form" in facts.columns:
+
+        facts["form"] = (
+            facts["form"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+        flow_mask = facts[
+            "metric"
+        ].isin(
+            flow_metrics
+        )
+
+        instant_mask = ~flow_mask
+
+        keep_flow = (
+            flow_mask
+            &
+            facts[
+                "form"
+            ].isin(
+                annual_forms
+            )
+        )
+
+        keep_instant = (
+            instant_mask
+            &
+            facts[
+                "form"
+            ].isin(
+                instant_forms
+            )
+        )
+
+        facts = facts[
+            keep_flow
+            |
+            keep_instant
+        ].copy()
+
+    # ------------------------------------------------------------------
+    # DURAÇÃO ANUAL — CÉLULA 33B: 250–450 dias
+    # ------------------------------------------------------------------
+
+    flow_mask = facts[
+        "metric"
+    ].isin(
+        flow_metrics
+    )
+
+    facts[
+        "duration_days"
+    ] = (
+        facts[
+            "end"
+        ]
+        -
+        facts[
+            "start"
+        ]
+    ).dt.days
+
+    # Se START existe para um fluxo, precisa ter duração anual.
+    # Mantemos apenas o fallback sem START para não quebrar uma tag SEC
+    # que excepcionalmente não carregue a data inicial.
+    valid_duration = (
+        facts[
+            "duration_days"
+        ].between(
+            250,
+            450,
+        )
+        |
+        facts[
+            "duration_days"
+        ].isna()
+    )
+
+    facts = facts[
+        (~flow_mask)
+        |
+        valid_duration
+    ].copy()
+
+    # ------------------------------------------------------------------
+    # DEDUPLICAÇÃO / ORDENAÇÃO POINT-IN-TIME
+    # ------------------------------------------------------------------
+
+    sort_cols = [
+        "ticker",
+        "metric",
+        "end",
+        "available_date",
     ]
+
+    if "concept" in facts.columns:
+        sort_cols.append(
+            "concept"
+        )
+
+    facts = (
+        facts
+        .sort_values(
+            sort_cols
+        )
+        .drop_duplicates(
+            subset=[
+                "ticker",
+                "metric",
+                "end",
+                "available_date",
+                "value",
+            ],
+            keep="last",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    return facts
+
+
+def _latest_metric(
+    history: pd.DataFrame,
+    metric: str,
+    snapshot: pd.Timestamp,
+):
+    """
+    Último fato conhecido no snapshot.
+
+    Igual ao princípio da Célula 33B:
+        filed/available_date <= snapshot
+        period_end/end       <= snapshot
+
+    Entre os fatos elegíveis, o período mais recente prevalece;
+    em empate, prevalece o filing mais recente.
+    """
+
+    temp = history[
+        (
+            history[
+                "metric"
+            ]
+            ==
+            metric
+        )
+        &
+        (
+            history[
+                "available_date"
+            ]
+            <=
+            snapshot
+        )
+        &
+        (
+            history[
+                "end"
+            ]
+            <=
+            snapshot
+        )
+    ].copy()
+
     if temp.empty:
         return None
-    return temp.sort_values(["available_date", "end"]).iloc[-1]
+
+    temp = temp.sort_values(
+        [
+            "end",
+            "available_date",
+        ]
+    )
+
+    return temp.iloc[-1]
 
 
 def _growth_yoy(history: pd.DataFrame, metric: str, snapshot: pd.Timestamp) -> float:
