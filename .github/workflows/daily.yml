@@ -1,1 +1,118 @@
+name: Portfolio Acoes Americano
 
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Segunda a sexta.
+    # 22:30 UTC = 19:30 no horário de Brasília.
+    # Executa após o fechamento do mercado americano.
+    - cron: "30 22 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  portfolio:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    steps:
+      # ================================================================
+      # 1. REPOSITÓRIO
+      # ================================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # 2. PYTHON
+      # ================================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ================================================================
+      # 3. DEPENDÊNCIAS
+      # ================================================================
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ================================================================
+      # 4. DIRETÓRIOS
+      # ================================================================
+
+      - name: Create directories
+        run: |
+          mkdir -p data
+          mkdir -p data/cache
+          mkdir -p output
+
+      # ================================================================
+      # 5. EXECUTAR MOTOR
+      # ================================================================
+
+      - name: Run portfolio engine
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python main.py
+
+      # ================================================================
+      # 6. MOSTRAR ARQUIVOS GERADOS
+      # ================================================================
+
+      - name: Show generated files
+        if: always()
+        run: |
+          echo "===== OUTPUT ====="
+          find output -maxdepth 2 -type f -print || true
+
+          echo "===== DATA ====="
+          find data -maxdepth 2 -type f -print || true
+
+      # ================================================================
+      # 7. SALVAR RELATÓRIOS COMO ARTIFACT
+      # ================================================================
+
+      - name: Upload reports
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-report
+          path: |
+            output/*.pdf
+            output/*.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      # ================================================================
+      # 8. PERSISTIR CARTEIRA ATUAL
+      # ================================================================
+      #
+      # O current_portfolio.csv precisa permanecer no repositório,
+      # pois será usado pela próxima execução para verificar rotação.
+      #
+      # ================================================================
+
+      - name: Commit current portfolio
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/current_portfolio.csv || true
+
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteração na carteira para salvar."
+          else
+            git commit -m "Update current portfolio"
+            git push
+          fi
