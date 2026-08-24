@@ -5,29 +5,30 @@
 #
 # RESPONSABILIDADE
 # ---------------
-# Centralizar a coleta e preparação dos dados usados pelo sistema:
+# Centralizar coleta e preparação dos dados:
 #
-#   1. Universo de ações americanas
-#   2. Setores
+#   1. Universo SEC
+#   2. Classificação setorial
 #   3. Preços históricos
-#   4. Mapeamento ticker -> CIK da SEC
+#   4. Ticker -> CIK
 #   5. SEC Company Facts
-#   6. Cache local
+#   6. Snapshot fundamental point-in-time
+#   7. Crescimentos YoY necessários ao selection.py
+#   8. Cache local
 #
 # IMPORTANTE
 # ----------
-# Este arquivo NÃO escolhe ações.
-# A seleção Top 5 por setor será feita em selection.py.
+# Este módulo NÃO seleciona ações.
+# A seleção Top 5 por setor pertence ao selection.py.
 #
 # ======================================================================================
-
 
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,12 +52,19 @@ from config import (
 DATA_PATH = Path(DATA_DIR)
 CACHE_PATH = Path(CACHE_DIR)
 
-DATA_PATH.mkdir(parents=True, exist_ok=True)
-CACHE_PATH.mkdir(parents=True, exist_ok=True)
+DATA_PATH.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+CACHE_PATH.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
 # ======================================================================================
-# 2. SESSÃO HTTP
+# 2. HTTP
 # ======================================================================================
 
 SESSION = requests.Session()
@@ -65,7 +73,6 @@ SESSION.headers.update(
     {
         "User-Agent": SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov",
     }
 )
 
@@ -74,10 +81,9 @@ SESSION.headers.update(
 # 3. HELPERS
 # ======================================================================================
 
-def normalize_ticker(ticker: str) -> str:
-    """
-    Padroniza ticker para uso interno.
-    """
+def normalize_ticker(
+    ticker: str,
+) -> str:
 
     return (
         str(ticker)
@@ -87,12 +93,12 @@ def normalize_ticker(ticker: str) -> str:
     )
 
 
-def safe_numeric(value):
-    """
-    Conversão segura para número.
-    """
+def safe_numeric(
+    value,
+):
 
     try:
+
         value = float(value)
 
         if np.isfinite(value):
@@ -104,22 +110,64 @@ def safe_numeric(value):
     return np.nan
 
 
+def safe_growth(
+    current,
+    previous,
+):
+    """
+    Crescimento simples:
+
+        current / previous - 1
+
+    Retorna NaN quando o denominador não é utilizável.
+    """
+
+    current = safe_numeric(
+        current
+    )
+
+    previous = safe_numeric(
+        previous
+    )
+
+    if (
+        not np.isfinite(current)
+        or
+        not np.isfinite(previous)
+        or
+        previous == 0
+    ):
+        return np.nan
+
+    result = (
+        current
+        /
+        previous
+        -
+        1.0
+    )
+
+    if not np.isfinite(result):
+        return np.nan
+
+    return result
+
+
 # ======================================================================================
-# 4. DOWNLOAD SEGURO
+# 4. DOWNLOAD JSON
 # ======================================================================================
 
 def request_json(
     url: str,
     retries: int = 3,
-    sleep_seconds: float = 0.25,
+    sleep_seconds: float = 0.30,
 ):
-    """
-    Requisição JSON com tentativas automáticas.
-    """
 
     last_error = None
 
-    for attempt in range(retries):
+    for attempt in range(
+        retries
+    ):
 
         try:
 
@@ -137,10 +185,16 @@ def request_json(
             last_error = exc
 
             if attempt < retries - 1:
-                time.sleep(sleep_seconds * (attempt + 1))
+
+                time.sleep(
+                    sleep_seconds
+                    *
+                    (attempt + 1)
+                )
 
     raise RuntimeError(
-        f"Falha ao acessar {url}: {last_error}"
+        f"Falha ao acessar {url}: "
+        f"{last_error}"
     )
 
 
@@ -153,7 +207,8 @@ def get_sec_ticker_map(
 ) -> pd.DataFrame:
 
     cache_file = (
-        CACHE_PATH /
+        CACHE_PATH
+        /
         "sec_ticker_map.parquet"
     )
 
@@ -163,25 +218,31 @@ def get_sec_ticker_map(
         not force_refresh
     ):
 
-        df = pd.read_parquet(
-            cache_file
-        )
+        try:
 
-        if not df.empty:
-            return df
+            cached = pd.read_parquet(
+                cache_file
+            )
 
+            if not cached.empty:
+                return cached
+
+        except Exception:
+            pass
 
     data = request_json(
         SEC_TICKER_MAP_URL
     )
-
 
     rows = []
 
     for item in data.values():
 
         ticker = normalize_ticker(
-            item.get("ticker", "")
+            item.get(
+                "ticker",
+                "",
+            )
         )
 
         cik = item.get(
@@ -192,29 +253,31 @@ def get_sec_ticker_map(
             "title"
         )
 
-
-        if not ticker or cik is None:
+        if (
+            not ticker
+            or
+            cik is None
+        ):
             continue
-
 
         rows.append(
             {
-                "ticker": ticker,
+                "ticker":
+                    ticker,
 
                 "cik":
-                    str(int(cik))
-                    .zfill(10),
+                    str(
+                        int(cik)
+                    ).zfill(10),
 
                 "company_name":
                     title,
             }
         )
 
-
     df = pd.DataFrame(
         rows
     )
-
 
     if df.empty:
 
@@ -222,22 +285,25 @@ def get_sec_ticker_map(
             "Mapa ticker/CIK da SEC retornou vazio."
         )
 
-
     df = (
         df
         .drop_duplicates(
-            subset=["ticker"]
+            subset=[
+                "ticker"
+            ]
         )
-        .sort_values("ticker")
-        .reset_index(drop=True)
+        .sort_values(
+            "ticker"
+        )
+        .reset_index(
+            drop=True
+        )
     )
-
 
     df.to_parquet(
         cache_file,
         index=False,
     )
-
 
     return df
 
@@ -245,18 +311,12 @@ def get_sec_ticker_map(
 # ======================================================================================
 # 6. UNIVERSO BASE
 # ======================================================================================
-#
-# O mapa da SEC é usado como universo inicial de empresas registradas.
-#
-# Depois buscamos a classificação setorial necessária.
-#
-# Não selecionamos Top 5 aqui.
-#
-# ======================================================================================
 
 def build_base_universe() -> pd.DataFrame:
 
-    sec_map = get_sec_ticker_map()
+    sec_map = (
+        get_sec_ticker_map()
+    )
 
     universe = (
         sec_map[
@@ -269,42 +329,37 @@ def build_base_universe() -> pd.DataFrame:
         .copy()
     )
 
-
     universe = universe[
-        universe["ticker"].notna()
+        universe[
+            "ticker"
+        ].notna()
     ]
 
-
     universe = universe[
-        ~universe["ticker"].str.contains(
+        ~universe[
+            "ticker"
+        ].str.contains(
             r"[\^/]",
             regex=True,
             na=False,
         )
     ]
 
-
-    universe = (
+    return (
         universe
         .drop_duplicates(
-            subset=["ticker"]
+            subset=[
+                "ticker"
+            ]
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
 
-    return universe
-
-
 # ======================================================================================
-# 7. CLASSIFICAÇÃO SETORIAL
-# ======================================================================================
-#
-# yfinance é usado aqui para descobrir o setor atual.
-#
-# Isso NÃO define a seleção.
-# Serve apenas para separar o universo nos três setores congelados.
-#
+# 7. SETORES
 # ======================================================================================
 
 def get_ticker_sector(
@@ -320,6 +375,9 @@ def get_ticker_sector(
         obj = yf.Ticker(
             ticker
         )
+
+        # fast_info não fornece setor.
+        # get_info continua sendo usado somente quando necessário.
 
         info = obj.get_info()
 
@@ -339,9 +397,232 @@ def get_ticker_sector(
         return None
 
 
-# ======================================================================================
-# 8. FILTRAR UNIVERSO POR SETORES
-# ======================================================================================
+def load_sector_cache() -> pd.DataFrame:
+
+    cache_file = (
+        CACHE_PATH
+        /
+        "ticker_sectors.parquet"
+    )
+
+    if not cache_file.exists():
+
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "sector",
+            ]
+        )
+
+    try:
+
+        df = pd.read_parquet(
+            cache_file
+        )
+
+        if (
+            "ticker" not in df.columns
+            or
+            "sector" not in df.columns
+        ):
+
+            return pd.DataFrame(
+                columns=[
+                    "ticker",
+                    "sector",
+                ]
+            )
+
+        df["ticker"] = (
+            df["ticker"]
+            .map(
+                normalize_ticker
+            )
+        )
+
+        return (
+            df
+            .drop_duplicates(
+                subset=[
+                    "ticker"
+                ],
+                keep="last",
+            )
+            .reset_index(
+                drop=True
+            )
+        )
+
+    except Exception:
+
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "sector",
+            ]
+        )
+
+
+def save_sector_cache(
+    sectors: pd.DataFrame,
+):
+
+    cache_file = (
+        CACHE_PATH
+        /
+        "ticker_sectors.parquet"
+    )
+
+    sectors.to_parquet(
+        cache_file,
+        index=False,
+    )
+
+
+def enrich_sectors(
+    universe: pd.DataFrame,
+    force_refresh: bool = False,
+    sleep_seconds: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Acrescenta setor ao universo.
+
+    O cache evita consultar yfinance para todos os
+    tickers em todas as execuções.
+    """
+
+    df = universe.copy()
+
+    df["ticker"] = (
+        df["ticker"]
+        .map(
+            normalize_ticker
+        )
+    )
+
+    cache = (
+        load_sector_cache()
+    )
+
+    cache_map = {}
+
+    if not cache.empty:
+
+        cache_map = dict(
+            zip(
+                cache[
+                    "ticker"
+                ],
+                cache[
+                    "sector"
+                ],
+            )
+        )
+
+    sector_rows = []
+
+    total = len(df)
+
+    for number, ticker in enumerate(
+        df["ticker"],
+        start=1,
+    ):
+
+        if (
+            not force_refresh
+            and
+            ticker in cache_map
+            and
+            pd.notna(
+                cache_map[ticker]
+            )
+        ):
+
+            sector = (
+                cache_map[
+                    ticker
+                ]
+            )
+
+        else:
+
+            sector = (
+                get_ticker_sector(
+                    ticker
+                )
+            )
+
+            time.sleep(
+                sleep_seconds
+            )
+
+        sector_rows.append(
+            {
+                "ticker":
+                    ticker,
+
+                "sector":
+                    sector,
+            }
+        )
+
+        if (
+            number % 100 == 0
+            or
+            number == total
+        ):
+
+            print(
+                f"Setores: "
+                f"{number:,}/{total:,}"
+            )
+
+    sectors = pd.DataFrame(
+        sector_rows
+    )
+
+    # Atualizar cache
+
+    combined_cache = pd.concat(
+        [
+            cache,
+            sectors,
+        ],
+        ignore_index=True,
+    )
+
+    combined_cache = (
+        combined_cache
+        .drop_duplicates(
+            subset=[
+                "ticker"
+            ],
+            keep="last",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    save_sector_cache(
+        combined_cache
+    )
+
+    df = df.drop(
+        columns=[
+            "sector"
+        ],
+        errors="ignore",
+    )
+
+    df = df.merge(
+        sectors,
+        on="ticker",
+        how="left",
+    )
+
+    return df
+
 
 def filter_target_sectors(
     universe: pd.DataFrame,
@@ -353,25 +634,29 @@ def filter_target_sectors(
             "A coluna 'sector' não existe no universo."
         )
 
-
     df = universe[
-        universe["sector"].isin(
+        universe[
+            "sector"
+        ].isin(
             SECTORS
         )
     ].copy()
 
-
     return (
         df
         .drop_duplicates(
-            subset=["ticker"]
+            subset=[
+                "ticker"
+            ]
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
 
 # ======================================================================================
-# 9. PREÇOS HISTÓRICOS
+# 8. PREÇOS HISTÓRICOS
 # ======================================================================================
 
 def download_prices(
@@ -388,13 +673,11 @@ def download_prices(
         }
     )
 
-
     if not tickers:
 
         raise ValueError(
             "Nenhum ticker recebido para download."
         )
-
 
     raw = yf.download(
         tickers=tickers,
@@ -407,30 +690,35 @@ def download_prices(
         group_by="column",
     )
 
-
     if raw.empty:
 
         raise RuntimeError(
             "Download de preços retornou vazio."
         )
 
-
-    # ------------------------------------------------------------------
-    # Extrair fechamento
-    # ------------------------------------------------------------------
-
     if isinstance(
         raw.columns,
         pd.MultiIndex,
     ):
 
-        if "Close" not in raw.columns.get_level_values(0):
+        if (
+            "Close"
+            not in
+            raw.columns.get_level_values(
+                0
+            )
+        ):
 
             raise RuntimeError(
                 "Coluna Close não encontrada."
             )
 
-        close = raw["Close"].copy()
+        close = (
+            raw[
+                "Close"
+            ]
+            .copy()
+        )
 
     else:
 
@@ -440,63 +728,68 @@ def download_prices(
                 "Coluna Close não encontrada."
             )
 
-        close = raw[["Close"]].copy()
+        close = (
+            raw[
+                [
+                    "Close"
+                ]
+            ]
+            .copy()
+        )
 
         if len(tickers) == 1:
-            close.columns = tickers
 
-
-    # ------------------------------------------------------------------
-    # Padronização
-    # ------------------------------------------------------------------
+            close.columns = (
+                tickers
+            )
 
     if isinstance(
         close,
         pd.Series,
     ):
 
-        close = close.to_frame(
-            name=tickers[0]
+        close = (
+            close.to_frame(
+                name=tickers[0]
+            )
         )
-
 
     close.columns = [
         normalize_ticker(c)
         for c in close.columns
     ]
 
-
     close.index = pd.to_datetime(
         close.index
     )
-
 
     try:
 
         close.index = (
             close.index
-            .tz_localize(None)
+            .tz_localize(
+                None
+            )
         )
 
     except Exception:
         pass
 
-
-    close = (
+    return (
         close
         .sort_index()
         .replace(
-            [np.inf, -np.inf],
+            [
+                np.inf,
+                -np.inf,
+            ],
             np.nan,
         )
     )
 
 
-    return close
-
-
 # ======================================================================================
-# 10. SEC COMPANY FACTS
+# 9. SEC COMPANY FACTS
 # ======================================================================================
 
 def get_company_facts(
@@ -508,12 +801,11 @@ def get_company_facts(
         cik
     ).zfill(10)
 
-
     cache_file = (
-        CACHE_PATH /
+        CACHE_PATH
+        /
         f"companyfacts_{cik}.json"
     )
-
 
     if (
         use_cache
@@ -536,14 +828,11 @@ def get_company_facts(
         except Exception:
             pass
 
-
     url = (
         f"{SEC_COMPANY_FACTS_URL}"
         f"CIK{cik}.json"
     )
 
-
-    # Company Facts usa data.sec.gov.
     headers = {
         "User-Agent":
             SEC_USER_AGENT,
@@ -552,9 +841,7 @@ def get_company_facts(
             "gzip, deflate",
     }
 
-
     last_error = None
-
 
     for attempt in range(3):
 
@@ -570,7 +857,6 @@ def get_company_facts(
 
             data = response.json()
 
-
             with open(
                 cache_file,
                 "w",
@@ -581,7 +867,6 @@ def get_company_facts(
                     data,
                     file,
                 )
-
 
             time.sleep(
                 0.12
@@ -594,9 +879,10 @@ def get_company_facts(
             last_error = exc
 
             time.sleep(
-                0.5 * (attempt + 1)
+                0.5
+                *
+                (attempt + 1)
             )
-
 
     raise RuntimeError(
         f"SEC Company Facts indisponível "
@@ -605,11 +891,7 @@ def get_company_facts(
 
 
 # ======================================================================================
-# 11. CONCEITOS FUNDAMENTAIS SEC
-# ======================================================================================
-#
-# Mantemos alternativas porque empresas podem usar conceitos XBRL diferentes.
-#
+# 10. CONCEITOS SEC
 # ======================================================================================
 
 SEC_CONCEPTS = {
@@ -652,10 +934,25 @@ SEC_CONCEPTS = {
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
     ],
 
+    # ------------------------------------------------------------------
+    # Dívida
+    # ------------------------------------------------------------------
+
     "long_term_debt": [
         "LongTermDebtNoncurrent",
         "LongTermDebt",
     ],
+
+    "short_term_debt": [
+        "ShortTermBorrowings",
+        "ShortTermDebtCurrent",
+        "LongTermDebtCurrent",
+        "CurrentPortionOfLongTermDebt",
+    ],
+
+    # ------------------------------------------------------------------
+    # EPS
+    # ------------------------------------------------------------------
 
     "diluted_eps": [
         "EarningsPerShareDiluted",
@@ -668,7 +965,7 @@ SEC_CONCEPTS = {
 
 
 # ======================================================================================
-# 12. LOCALIZAR CONCEITO SEC
+# 11. LOCALIZAR CONCEITO SEC
 # ======================================================================================
 
 def find_sec_concept(
@@ -678,10 +975,15 @@ def find_sec_concept(
 
     facts = (
         company_facts
-        .get("facts", {})
-        .get("us-gaap", {})
+        .get(
+            "facts",
+            {}
+        )
+        .get(
+            "us-gaap",
+            {}
+        )
     )
-
 
     for concept in concept_names:
 
@@ -689,15 +991,19 @@ def find_sec_concept(
 
             return (
                 concept,
-                facts[concept]
+                facts[
+                    concept
+                ],
             )
 
-
-    return None, None
+    return (
+        None,
+        None,
+    )
 
 
 # ======================================================================================
-# 13. EXTRAIR OBSERVAÇÕES DE UM CONCEITO
+# 12. EXTRAIR OBSERVAÇÕES
 # ======================================================================================
 
 def extract_concept_observations(
@@ -707,52 +1013,57 @@ def extract_concept_observations(
     metric_name: str,
 ) -> pd.DataFrame:
 
-    concept, fact = find_sec_concept(
-        company_facts,
-        concept_names,
+    concept, fact = (
+        find_sec_concept(
+            company_facts,
+            concept_names,
+        )
     )
-
 
     if fact is None:
 
         return pd.DataFrame()
-
 
     units = fact.get(
         "units",
         {}
     )
 
-
     rows = []
 
-
-    for unit_name, observations in units.items():
+    for (
+        unit_name,
+        observations
+    ) in units.items():
 
         for obs in observations:
 
             value = safe_numeric(
-                obs.get("val")
+                obs.get(
+                    "val"
+                )
             )
-
 
             filed = pd.to_datetime(
-                obs.get("filed"),
+                obs.get(
+                    "filed"
+                ),
                 errors="coerce",
             )
-
 
             end = pd.to_datetime(
-                obs.get("end"),
+                obs.get(
+                    "end"
+                ),
                 errors="coerce",
             )
-
 
             start = pd.to_datetime(
-                obs.get("start"),
+                obs.get(
+                    "start"
+                ),
                 errors="coerce",
             )
-
 
             if (
                 pd.isna(filed)
@@ -763,11 +1074,12 @@ def extract_concept_observations(
             ):
                 continue
 
-
             rows.append(
                 {
                     "ticker":
-                        normalize_ticker(ticker),
+                        normalize_ticker(
+                            ticker
+                        ),
 
                     "metric":
                         metric_name,
@@ -791,33 +1103,39 @@ def extract_concept_observations(
                         filed,
 
                     "form":
-                        obs.get("form"),
+                        obs.get(
+                            "form"
+                        ),
 
                     "fy":
-                        obs.get("fy"),
+                        obs.get(
+                            "fy"
+                        ),
 
                     "fp":
-                        obs.get("fp"),
+                        obs.get(
+                            "fp"
+                        ),
 
                     "accn":
-                        obs.get("accn"),
+                        obs.get(
+                            "accn"
+                        ),
                 }
             )
-
 
     if not rows:
 
         return pd.DataFrame()
 
-
     df = pd.DataFrame(
         rows
     )
 
-
-    # Somente demonstrações relevantes
     df = df[
-        df["form"].isin(
+        df[
+            "form"
+        ].isin(
             [
                 "10-K",
                 "10-Q",
@@ -827,21 +1145,17 @@ def extract_concept_observations(
         )
     ].copy()
 
-
     # ------------------------------------------------------------------
-    # Regra point-in-time
-    # ------------------------------------------------------------------
+    # POINT-IN-TIME
     #
-    # O dado só passa a existir para o modelo a partir da data FILED.
-    #
-    # Nunca usamos a data END como se o mercado já soubesse o resultado.
-    #
+    # O mercado somente conhece o dado depois do FILED.
     # ------------------------------------------------------------------
 
-    df["available_date"] = (
-        df["filed"]
-    )
-
+    df[
+        "available_date"
+    ] = df[
+        "filed"
+    ]
 
     df = (
         df
@@ -861,15 +1175,16 @@ def extract_concept_observations(
             ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
-
 
     return df
 
 
 # ======================================================================================
-# 14. EXTRAIR FUNDAMENTOS DE UMA EMPRESA
+# 13. FUNDAMENTOS DE UMA EMPRESA
 # ======================================================================================
 
 def extract_company_fundamentals(
@@ -878,24 +1193,28 @@ def extract_company_fundamentals(
     use_cache: bool = True,
 ) -> pd.DataFrame:
 
-    company_facts = get_company_facts(
-        cik=cik,
-        use_cache=use_cache,
+    company_facts = (
+        get_company_facts(
+            cik=cik,
+            use_cache=use_cache,
+        )
     )
-
 
     parts = []
 
+    for (
+        metric_name,
+        concepts
+    ) in SEC_CONCEPTS.items():
 
-    for metric_name, concepts in SEC_CONCEPTS.items():
-
-        temp = extract_concept_observations(
-            company_facts=company_facts,
-            concept_names=concepts,
-            ticker=ticker,
-            metric_name=metric_name,
+        temp = (
+            extract_concept_observations(
+                company_facts=company_facts,
+                concept_names=concepts,
+                ticker=ticker,
+                metric_name=metric_name,
+            )
         )
-
 
         if not temp.empty:
 
@@ -903,35 +1222,32 @@ def extract_company_fundamentals(
                 temp
             )
 
-
     if not parts:
 
         return pd.DataFrame()
 
-
-    result = pd.concat(
+    return pd.concat(
         parts,
         ignore_index=True,
     )
 
 
-    return result
-
-
 # ======================================================================================
-# 15. EXTRAIR FUNDAMENTOS DE VÁRIAS EMPRESAS
+# 14. FUNDAMENTOS DE VÁRIAS EMPRESAS
 # ======================================================================================
 
 def download_fundamentals(
     universe: pd.DataFrame,
     use_cache: bool = True,
-) -> pd.DataFrame:
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+]:
 
     required = {
         "ticker",
         "cik",
     }
-
 
     if not required.issubset(
         universe.columns
@@ -941,19 +1257,17 @@ def download_fundamentals(
             "Universo precisa conter ticker e cik."
         )
 
-
     parts = []
-
     errors = []
-
 
     total = len(
         universe
     )
 
-
     for number, row in enumerate(
-        universe.itertuples(index=False),
+        universe.itertuples(
+            index=False
+        ),
         start=1,
     ):
 
@@ -965,22 +1279,21 @@ def download_fundamentals(
             row.cik
         ).zfill(10)
 
-
         print(
             f"[{number:03d}/{total:03d}] "
             f"{ticker:<7}",
-            end=" "
+            end=" ",
         )
-
 
         try:
 
-            temp = extract_company_fundamentals(
-                ticker=ticker,
-                cik=cik,
-                use_cache=use_cache,
+            temp = (
+                extract_company_fundamentals(
+                    ticker=ticker,
+                    cik=cik,
+                    use_cache=use_cache,
+                )
             )
-
 
             if temp.empty:
 
@@ -1000,16 +1313,13 @@ def download_fundamentals(
 
                 continue
 
-
             parts.append(
                 temp
             )
 
-
             print(
                 f"OK ({len(temp):,})"
             )
-
 
         except Exception as exc:
 
@@ -1027,7 +1337,6 @@ def download_fundamentals(
                 }
             )
 
-
     if parts:
 
         fundamentals = pd.concat(
@@ -1037,19 +1346,203 @@ def download_fundamentals(
 
     else:
 
-        fundamentals = pd.DataFrame()
-
+        fundamentals = (
+            pd.DataFrame()
+        )
 
     errors_df = pd.DataFrame(
         errors
     )
 
-
-    return fundamentals, errors_df
+    return (
+        fundamentals,
+        errors_df,
+    )
 
 
 # ======================================================================================
-# 16. SNAPSHOT POINT-IN-TIME
+# 15. ESCOLHER ÚLTIMA OBSERVAÇÃO CONHECIDA
+# ======================================================================================
+
+def _latest_metric_observation(
+    df: pd.DataFrame,
+) -> pd.Series:
+
+    ordered = (
+        df
+        .sort_values(
+            [
+                "available_date",
+                "end",
+                "filed",
+            ]
+        )
+    )
+
+    return ordered.iloc[
+        -1
+    ]
+
+
+# ======================================================================================
+# 16. CRESCIMENTO YOY POINT-IN-TIME
+# ======================================================================================
+
+def calculate_point_in_time_growth(
+    metric_history: pd.DataFrame,
+    as_of_date,
+) -> float:
+    """
+    Calcula crescimento YoY usando SOMENTE informações
+    disponíveis até as_of_date.
+
+    Procedimento:
+        1. filtra available_date <= as_of_date
+        2. pega a observação mais recente
+        3. procura observação comparável aproximadamente
+           um ano antes
+        4. calcula current / previous - 1
+
+    A janela de comparação aceita 300–430 dias.
+    """
+
+    if metric_history.empty:
+        return np.nan
+
+    df = metric_history.copy()
+
+    df[
+        "available_date"
+    ] = pd.to_datetime(
+        df[
+            "available_date"
+        ],
+        errors="coerce",
+    )
+
+    df[
+        "end"
+    ] = pd.to_datetime(
+        df[
+            "end"
+        ],
+        errors="coerce",
+    )
+
+    as_of_date = pd.Timestamp(
+        as_of_date
+    )
+
+    df = df[
+        df[
+            "available_date"
+        ]
+        <=
+        as_of_date
+    ].copy()
+
+    df = df[
+        df[
+            "end"
+        ].notna()
+        &
+        df[
+            "value"
+        ].notna()
+    ].copy()
+
+    if len(df) < 2:
+        return np.nan
+
+    current = (
+        _latest_metric_observation(
+            df
+        )
+    )
+
+    current_end = pd.Timestamp(
+        current[
+            "end"
+        ]
+    )
+
+    # ------------------------------------------------------------------
+    # Observações anteriores com aproximadamente 1 ano de diferença
+    # ------------------------------------------------------------------
+
+    candidates = df[
+        df[
+            "end"
+        ]
+        <
+        current_end
+    ].copy()
+
+    if candidates.empty:
+        return np.nan
+
+    candidates[
+        "days_difference"
+    ] = (
+        current_end
+        -
+        candidates[
+            "end"
+        ]
+    ).dt.days
+
+    candidates = candidates[
+        candidates[
+            "days_difference"
+        ].between(
+            300,
+            430,
+        )
+    ].copy()
+
+    if candidates.empty:
+        return np.nan
+
+    candidates[
+        "distance_to_year"
+    ] = (
+        candidates[
+            "days_difference"
+        ]
+        -
+        365
+    ).abs()
+
+    candidates = (
+        candidates
+        .sort_values(
+            [
+                "distance_to_year",
+                "available_date",
+            ],
+            ascending=[
+                True,
+                False,
+            ],
+        )
+    )
+
+    previous = candidates.iloc[
+        0
+    ]
+
+    return safe_growth(
+        current[
+            "value"
+        ],
+        previous[
+            "value"
+        ],
+    )
+
+
+# ======================================================================================
+# 17. SNAPSHOT FUNDAMENTAL POINT-IN-TIME
 # ======================================================================================
 
 def latest_fundamental_snapshot(
@@ -1061,19 +1554,41 @@ def latest_fundamental_snapshot(
 
         return pd.DataFrame()
 
-
     df = fundamentals.copy()
 
-
-    df["available_date"] = pd.to_datetime(
-        df["available_date"],
+    df[
+        "available_date"
+    ] = pd.to_datetime(
+        df[
+            "available_date"
+        ],
         errors="coerce",
     )
 
+    df[
+        "filed"
+    ] = pd.to_datetime(
+        df[
+            "filed"
+        ],
+        errors="coerce",
+    )
+
+    df[
+        "end"
+    ] = pd.to_datetime(
+        df[
+            "end"
+        ],
+        errors="coerce",
+    )
 
     if as_of_date is None:
 
-        as_of_date = pd.Timestamp.today().normalize()
+        as_of_date = (
+            pd.Timestamp.today()
+            .normalize()
+        )
 
     else:
 
@@ -1081,26 +1596,28 @@ def latest_fundamental_snapshot(
             as_of_date
         )
 
-
     # ------------------------------------------------------------------
-    # Anti-look-ahead
+    # ANTI-LOOK-AHEAD
     # ------------------------------------------------------------------
 
-    df = df[
-        df["available_date"]
+    known = df[
+        df[
+            "available_date"
+        ]
         <=
         as_of_date
     ].copy()
 
-
-    if df.empty:
+    if known.empty:
 
         return pd.DataFrame()
 
+    # ------------------------------------------------------------------
+    # Último fato conhecido por ticker/métrica
+    # ------------------------------------------------------------------
 
-    # Último fato conhecido para cada métrica.
     latest = (
-        df
+        known
         .sort_values(
             [
                 "ticker",
@@ -1119,7 +1636,6 @@ def latest_fundamental_snapshot(
         .tail(1)
     )
 
-
     wide = (
         latest
         .pivot(
@@ -1130,15 +1646,333 @@ def latest_fundamental_snapshot(
         .reset_index()
     )
 
-
     wide.columns.name = None
 
+    # ------------------------------------------------------------------
+    # Crescimentos necessários ao fator GROWTH
+    # ------------------------------------------------------------------
 
-    return wide
+    growth_metrics = {
+        "revenue":
+            "revenue_growth",
+
+        "diluted_eps":
+            "eps_growth",
+
+        "operating_cash_flow":
+            "operating_cash_flow_growth",
+    }
+
+    growth_rows = []
+
+    for ticker in (
+        wide[
+            "ticker"
+        ].unique()
+    ):
+
+        ticker_history = known[
+            known[
+                "ticker"
+            ]
+            ==
+            ticker
+        ]
+
+        row = {
+            "ticker":
+                ticker,
+        }
+
+        for (
+            raw_metric,
+            output_metric
+        ) in growth_metrics.items():
+
+            history = ticker_history[
+                ticker_history[
+                    "metric"
+                ]
+                ==
+                raw_metric
+            ]
+
+            row[
+                output_metric
+            ] = (
+                calculate_point_in_time_growth(
+                    metric_history=history,
+                    as_of_date=as_of_date,
+                )
+            )
+
+        growth_rows.append(
+            row
+        )
+
+    growth_df = pd.DataFrame(
+        growth_rows
+    )
+
+    wide = wide.merge(
+        growth_df,
+        on="ticker",
+        how="left",
+    )
+
+    # ------------------------------------------------------------------
+    # Métricas derivadas úteis ao selection.py
+    # ------------------------------------------------------------------
+
+    required_numeric = [
+        "revenue",
+        "net_income",
+        "operating_income",
+        "operating_cash_flow",
+        "assets",
+        "equity",
+        "cash",
+        "long_term_debt",
+        "short_term_debt",
+        "diluted_eps",
+    ]
+
+    for column in required_numeric:
+
+        if column not in wide.columns:
+
+            wide[
+                column
+            ] = np.nan
+
+        wide[
+            column
+        ] = pd.to_numeric(
+            wide[
+                column
+            ],
+            errors="coerce",
+        )
+
+    # Dívida total
+
+    debt_components = (
+        wide[
+            "long_term_debt"
+        ].fillna(0)
+        +
+        wide[
+            "short_term_debt"
+        ].fillna(0)
+    )
+
+    no_debt_data = (
+        wide[
+            "long_term_debt"
+        ].isna()
+        &
+        wide[
+            "short_term_debt"
+        ].isna()
+    )
+
+    debt_components.loc[
+        no_debt_data
+    ] = np.nan
+
+    wide[
+        "total_debt"
+    ] = debt_components
+
+    # ------------------------------------------------------------------
+    # Ratios
+    # ------------------------------------------------------------------
+
+    def divide_columns(
+        numerator: str,
+        denominator: str,
+    ) -> pd.Series:
+
+        result = (
+            wide[
+                numerator
+            ]
+            /
+            wide[
+                denominator
+            ].replace(
+                0,
+                np.nan,
+            )
+        )
+
+        return result.replace(
+            [
+                np.inf,
+                -np.inf,
+            ],
+            np.nan,
+        )
+
+    wide[
+        "cash_assets"
+    ] = divide_columns(
+        "cash",
+        "assets",
+    )
+
+    wide[
+        "debt_assets"
+    ] = divide_columns(
+        "total_debt",
+        "assets",
+    )
+
+    wide[
+        "debt_equity"
+    ] = divide_columns(
+        "total_debt",
+        "equity",
+    )
+
+    wide[
+        "roa"
+    ] = divide_columns(
+        "net_income",
+        "assets",
+    )
+
+    wide[
+        "roe"
+    ] = divide_columns(
+        "net_income",
+        "equity",
+    )
+
+    wide[
+        "operating_margin"
+    ] = divide_columns(
+        "operating_income",
+        "revenue",
+    )
+
+    wide[
+        "net_margin"
+    ] = divide_columns(
+        "net_income",
+        "revenue",
+    )
+
+    return (
+        wide
+        .sort_values(
+            "ticker"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
 
 
 # ======================================================================================
-# 17. AUDITORIA DE LOOK-AHEAD
+# 18. PREPARAR SNAPSHOT PARA SELEÇÃO
+# ======================================================================================
+
+def prepare_selection_snapshot(
+    universe: pd.DataFrame,
+    fundamentals: pd.DataFrame,
+    as_of_date=None,
+) -> pd.DataFrame:
+    """
+    Une:
+        universo
+        + setor
+        + snapshot fundamental
+
+    Saída pronta para selection.py.
+    """
+
+    required = {
+        "ticker",
+        "sector",
+    }
+
+    if not required.issubset(
+        universe.columns
+    ):
+
+        raise ValueError(
+            "Universo precisa conter ticker e sector."
+        )
+
+    snapshot = (
+        latest_fundamental_snapshot(
+            fundamentals=fundamentals,
+            as_of_date=as_of_date,
+        )
+    )
+
+    if snapshot.empty:
+
+        raise RuntimeError(
+            "Snapshot fundamental retornou vazio."
+        )
+
+    base_columns = [
+        column
+        for column in [
+            "ticker",
+            "cik",
+            "company_name",
+            "sector",
+        ]
+        if column in universe.columns
+    ]
+
+    base = (
+        universe[
+            base_columns
+        ]
+        .copy()
+    )
+
+    base[
+        "ticker"
+    ] = base[
+        "ticker"
+    ].map(
+        normalize_ticker
+    )
+
+    result = base.merge(
+        snapshot,
+        on="ticker",
+        how="inner",
+    )
+
+    result = result[
+        result[
+            "sector"
+        ].isin(
+            SECTORS
+        )
+    ].copy()
+
+    return (
+        result
+        .drop_duplicates(
+            subset=[
+                "ticker"
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# ======================================================================================
+# 19. AUDITORIA DE LOOK-AHEAD
 # ======================================================================================
 
 def audit_lookahead(
@@ -1149,27 +1983,111 @@ def audit_lookahead(
 
         return 0
 
-
-    invalid = (
-        pd.to_datetime(
-            fundamentals["available_date"],
-            errors="coerce",
-        )
-        <
-        pd.to_datetime(
-            fundamentals["filed"],
-            errors="coerce",
-        )
+    available = pd.to_datetime(
+        fundamentals[
+            "available_date"
+        ],
+        errors="coerce",
     )
 
+    filed = pd.to_datetime(
+        fundamentals[
+            "filed"
+        ],
+        errors="coerce",
+    )
+
+    invalid = (
+        available
+        <
+        filed
+    )
 
     return int(
-        invalid.fillna(False).sum()
+        invalid
+        .fillna(False)
+        .sum()
     )
 
 
 # ======================================================================================
-# 18. TESTE DO MÓDULO
+# 20. AUDITORIA DO SNAPSHOT DE SELEÇÃO
+# ======================================================================================
+
+def audit_selection_snapshot(
+    snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+
+    metrics = [
+
+        # Health Care
+        "cash_assets",
+        "debt_assets",
+        "debt_equity",
+
+        # Industrials
+        "revenue_growth",
+        "eps_growth",
+        "operating_cash_flow_growth",
+
+        # Technology
+        "roa",
+        "roe",
+        "operating_margin",
+        "net_margin",
+    ]
+
+    rows = []
+
+    total = len(
+        snapshot
+    )
+
+    for metric in metrics:
+
+        if metric in snapshot.columns:
+
+            available = int(
+                snapshot[
+                    metric
+                ]
+                .notna()
+                .sum()
+            )
+
+        else:
+
+            available = 0
+
+        rows.append(
+            {
+                "metric":
+                    metric,
+
+                "available":
+                    available,
+
+                "total":
+                    total,
+
+                "coverage":
+                    (
+                        available
+                        /
+                        total
+                        if total
+                        else np.nan
+                    ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ======================================================================================
+# 21. TESTE DO MÓDULO
 # ======================================================================================
 
 if __name__ == "__main__":
@@ -1186,48 +2104,91 @@ if __name__ == "__main__":
         "=" * 100
     )
 
-
     print(
         "\nCarregando mapa oficial da SEC..."
     )
 
-
-    sec_map = get_sec_ticker_map()
-
-
-    print(
-        f"Tickers SEC: {len(sec_map):,}"
+    sec_map = (
+        get_sec_ticker_map()
     )
 
+    print(
+        f"Tickers SEC: "
+        f"{len(sec_map):,}"
+    )
 
     print(
         "\nConstruindo universo base..."
     )
 
-
-    universe = build_base_universe()
-
+    universe = (
+        build_base_universe()
+    )
 
     print(
         f"Empresas no universo base: "
         f"{len(universe):,}"
     )
 
+    print(
+        "\nMétricas produzidas para o selection.py:"
+    )
+
+    print(
+        "  Health Care:"
+    )
+    print(
+        "    cash_assets"
+    )
+    print(
+        "    debt_assets"
+    )
+    print(
+        "    debt_equity"
+    )
+
+    print(
+        "  Industrials:"
+    )
+    print(
+        "    revenue_growth"
+    )
+    print(
+        "    eps_growth"
+    )
+    print(
+        "    operating_cash_flow_growth"
+    )
+
+    print(
+        "  Information Technology:"
+    )
+    print(
+        "    roa"
+    )
+    print(
+        "    roe"
+    )
+    print(
+        "    operating_margin"
+    )
+    print(
+        "    net_margin"
+    )
+
+    print(
+        "\nPoint-in-time:"
+    )
+
+    print(
+        "  available_date = filed"
+    )
+
+    print(
+        "  crescimento YoY usa somente dados "
+        "conhecidos até a data do snapshot"
+    )
 
     print(
         "\nData layer carregada com sucesso."
-    )
-
-
-    print(
-        "\nATENÇÃO:"
-    )
-
-    print(
-        "A classificação setorial completa será "
-        "preparada antes da seleção."
-    )
-
-    print(
-        "Nenhuma ação foi selecionada neste módulo."
     )
