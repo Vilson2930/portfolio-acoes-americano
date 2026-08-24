@@ -1,36 +1,15 @@
 # ======================================================================================
 # PORTFOLIO ACOES AMERICANO
-# main.py
-# ======================================================================================
-#
-# RESPONSABILIDADE
-# ---------------
-# Orquestrar a execução completa do sistema:
-#
-#   1. validar config
-#   2. construir universo
-#   3. classificar setores
-#   4. baixar fundamentos
-#   5. construir snapshot fundamental
-#   6. selecionar 15 ações
-#   7. baixar preços
-#   8. classificar entrada
-#   9. gerar CSV + PDF
-#
+# main.py — VERSÃO CORRIGIDA PARA ENTRY HISTÓRICO
 # ======================================================================================
 
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-
 import pandas as pd
 
-from config import (
-    SECTORS,
-    OUTPUT_DIR,
-    validate_config,
-)
+from config import SECTORS, OUTPUT_DIR, validate_config
 
 from data import (
     build_base_universe,
@@ -41,412 +20,135 @@ from data import (
     download_prices,
 )
 
-from selection import (
-    select_portfolio,
-    build_frontier_audit,
-)
-
-from entry import (
-    classify_portfolio_entries,
-    audit_entry_ranking,
-)
-
-from report import (
-    generate_reports,
-)
+from selection import select_portfolio, build_frontier_audit
+from entry import classify_portfolio_entries, audit_entry_ranking
+from report import generate_reports
 
 
-# ======================================================================================
-# 1. DIRETÓRIOS
-# ======================================================================================
-
-Path(
-    OUTPUT_DIR
-).mkdir(
-    parents=True,
-    exist_ok=True,
-)
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 
-# ======================================================================================
-# 2. CABEÇALHO
-# ======================================================================================
+def print_header(title: str):
+    print("\n" + "=" * 110)
+    print(title)
+    print("=" * 110)
 
-def print_header(
-    title: str,
-):
-
-    print(
-        "\n"
-        +
-        "=" * 110
-    )
-
-    print(
-        title
-    )
-
-    print(
-        "=" * 110
-    )
-
-
-# ======================================================================================
-# 3. EXECUÇÃO PRINCIPAL
-# ======================================================================================
 
 def run():
 
-    started_at = (
-        datetime.now()
-    )
+    started_at = datetime.now()
 
-    print_header(
-        "PORTFOLIO ACOES AMERICANO — EXECUÇÃO DIÁRIA"
-    )
+    print_header("PORTFOLIO ACOES AMERICANO — EXECUÇÃO DIÁRIA")
 
-    print(
-        f"\nInício: "
-        f"{started_at.strftime('%d/%m/%Y %H:%M:%S')}"
-    )
-
-    # ==================================================================================
-    # CONFIG
-    # ==================================================================================
-
-    print_header(
-        "1. CONFIGURAÇÃO"
-    )
-
+    # 1. CONFIG
+    print_header("1. CONFIGURAÇÃO")
     validate_config()
+    print("Configuração validada.")
 
-    print(
-        "Configuração validada."
-    )
+    # 2. UNIVERSO
+    print_header("2. UNIVERSO")
+    universe = build_base_universe()
+    print(f"Empresas no universo: {len(universe):,}")
 
-    print(
-        f"Setores: "
-        f"{', '.join(SECTORS)}"
-    )
+    # 3. SETORES
+    print_header("3. CLASSIFICAÇÃO SETORIAL")
+    universe = enrich_sectors(universe)
+    universe = filter_target_sectors(universe)
 
-    # ==================================================================================
-    # UNIVERSO
-    # ==================================================================================
-
-    print_header(
-        "2. UNIVERSO"
-    )
-
-    universe = (
-        build_base_universe()
-    )
-
-    print(
-        f"Empresas SEC: "
-        f"{len(universe):,}"
-    )
-
-    # ==================================================================================
-    # SETORES
-    # ==================================================================================
-
-    print_header(
-        "3. CLASSIFICAÇÃO SETORIAL"
-    )
-
-    universe = (
-        enrich_sectors(
-            universe
-        )
-    )
-
-    universe = (
-        filter_target_sectors(
-            universe
-        )
-    )
-
-    print(
-        f"Empresas nos três setores: "
-        f"{len(universe):,}"
-    )
-
-    sector_counts = (
-        universe[
-            "sector"
-        ]
-        .value_counts()
-    )
-
-    print(
-        "\nDistribuição:"
-    )
-
+    counts = universe["sector"].value_counts()
     for sector in SECTORS:
+        print(f"  {sector:<28} {int(counts.get(sector, 0)):,}")
 
-        print(
-            f"  {sector:<28} "
-            f"{int(sector_counts.get(sector, 0)):,}"
-        )
-
-    # ==================================================================================
-    # FUNDAMENTOS SEC
-    # ==================================================================================
-
-    print_header(
-        "4. FUNDAMENTOS SEC"
+    # 4. FUNDAMENTOS
+    print_header("4. FUNDAMENTOS SEC")
+    fundamentals, fundamental_errors = download_fundamentals(
+        universe=universe,
+        use_cache=True,
     )
 
-    fundamentals, fundamental_errors = (
-        download_fundamentals(
-            universe=universe,
-            use_cache=True,
-        )
-    )
-
-    print(
-        f"\nObservações fundamentais: "
-        f"{len(fundamentals):,}"
-    )
-
-    print(
-        f"Empresas com erro: "
-        f"{len(fundamental_errors):,}"
-    )
+    print(f"Observações fundamentais: {len(fundamentals):,}")
+    print(f"Empresas com erro: {len(fundamental_errors):,}")
 
     if fundamentals.empty:
+        raise RuntimeError("Nenhum fundamento SEC foi obtido.")
 
-        raise RuntimeError(
-            "Nenhum fundamento SEC foi obtido."
-        )
+    # 5. SNAPSHOT ATUAL PARA SELEÇÃO
+    print_header("5. SNAPSHOT FUNDAMENTAL")
+    today = pd.Timestamp.today().normalize()
 
-    # ==================================================================================
-    # SNAPSHOT PARA SELEÇÃO
-    # ==================================================================================
-
-    print_header(
-        "5. SNAPSHOT FUNDAMENTAL"
+    snapshot = prepare_selection_snapshot(
+        universe=universe,
+        fundamentals=fundamentals,
+        as_of_date=today,
     )
 
-    snapshot = (
-        prepare_selection_snapshot(
-            universe=universe,
-            fundamentals=fundamentals,
-            as_of_date=pd.Timestamp.today(),
-        )
-    )
+    print(f"Empresas no snapshot: {len(snapshot):,}")
 
-    print(
-        f"Empresas no snapshot: "
-        f"{len(snapshot):,}"
-    )
-
-    if snapshot.empty:
-
-        raise RuntimeError(
-            "Snapshot de seleção está vazio."
-        )
-
-    # ==================================================================================
-    # SELEÇÃO DAS 15 AÇÕES
-    # ==================================================================================
-
-    print_header(
-        "6. SELEÇÃO FUNDAMENTAL — TOP 5 POR SETOR"
-    )
-
-    portfolio = (
-        select_portfolio(
-            universe=snapshot,
-            use_previous_portfolio=True,
-        )
-    )
-
-    print(
-        "\nCarteira selecionada:"
+    # 6. SELEÇÃO
+    print_header("6. SELEÇÃO FUNDAMENTAL — TOP 5 POR SETOR")
+    portfolio = select_portfolio(
+        universe=snapshot,
+        use_previous_portfolio=True,
     )
 
     for sector in SECTORS:
+        tickers = portfolio.loc[
+            portfolio["sector"] == sector,
+            "ticker",
+        ].tolist()
+        print(f"  {sector:<28}: {', '.join(tickers)}")
 
-        tickers = (
-            portfolio[
-                portfolio[
-                    "sector"
-                ]
-                ==
-                sector
-            ][
-                "ticker"
-            ]
-            .tolist()
-        )
-
-        print(
-            f"  {sector:<28}: "
-            f"{', '.join(tickers)}"
-        )
-
-    # ==================================================================================
-    # AUDITORIA DA FRONTEIRA
-    # ==================================================================================
-
-    print_header(
-        "7. AUDITORIA DA FRONTEIRA"
-    )
-
-    frontier = (
-        build_frontier_audit(
-            snapshot
-        )
-    )
-
+    # 7. FRONTEIRA
+    print_header("7. AUDITORIA DA FRONTEIRA")
+    frontier = build_frontier_audit(snapshot)
     if frontier.empty:
-
-        print(
-            "Sem auditoria de fronteira disponível."
-        )
-
+        print("Sem auditoria disponível.")
     else:
+        print(frontier.to_string(index=False))
 
-        print(
-            frontier.to_string(
-                index=False
-            )
-        )
+    # 8. PREÇOS
+    print_header("8. PREÇOS")
+    selected_tickers = portfolio["ticker"].tolist()
 
-    # ==================================================================================
-    # PREÇOS
-    # ==================================================================================
-
-    print_header(
-        "8. PREÇOS"
+    # 2013 garante janela para indicadores de 3 anos antes dos snapshots úteis.
+    prices = download_prices(
+        tickers=selected_tickers,
+        start="2013-01-01",
     )
 
-    selected_tickers = (
-        portfolio[
-            "ticker"
-        ]
-        .tolist()
+    print(f"Tickers com preços: {len(prices.columns)}")
+    print(f"Primeira data: {prices.index.min().date()}")
+    print(f"Última data: {prices.index.max().date()}")
+
+    # 9. ENTRY — AGORA COM HISTÓRICO POINT-IN-TIME
+    print_header("9. CLASSIFICAÇÃO DE ENTRADA — HISTÓRICO CÉLULA 41")
+
+    ranking = classify_portfolio_entries(
+        portfolio=portfolio,
+        prices=prices,
+        fundamentals_history=fundamentals,
+        as_of_date=today,
     )
 
-    prices = (
-        download_prices(
-            tickers=selected_tickers,
-            start="2013-01-01",
-        )
-    )
+    audit = audit_entry_ranking(ranking)
 
-    print(
-        f"Tickers com preços: "
-        f"{len(prices.columns)}"
-    )
+    print("\nAuditoria:")
+    print(f"  Ações               : {audit['number_of_stocks']}")
+    print(f"  Setores              : {audit['number_of_sectors']}")
+    print(f"  Entrada Forte        : {audit['entry_strong']}")
+    print(f"  Entrada              : {audit['entry']}")
+    print(f"  Aguardar             : {audit['wait']}")
+    print(f"  Não comprar agora    : {audit['do_not_buy']}")
+    print(f"  Estrutura OK         : {audit['structure_ok']}")
 
-    print(
-        f"Primeira data: "
-        f"{prices.index.min().date()}"
-    )
+    if not audit["structure_ok"]:
+        raise RuntimeError("Auditoria final da carteira falhou.")
 
-    print(
-        f"Última data: "
-        f"{prices.index.max().date()}"
-    )
+    # 10. RANKING
+    print_header("10. RANKING FINAL")
 
-    # ==================================================================================
-    # VALUATION HISTÓRICO
-    # ==================================================================================
-    #
-    # Neste primeiro GitHub operacional, o valuation histórico ainda é opcional.
-    #
-    # Se existir um arquivo persistente produzido posteriormente, ele pode ser
-    # carregado aqui.
-    #
-    # Sem essa base, Health Care utiliza os componentes disponíveis e o relatório
-    # indicará N/D quando valuation não puder ser calculado.
-    #
-    # ==================================================================================
-
-    historical_valuation = None
-
-    # ==================================================================================
-    # CLASSIFICAÇÃO DE ENTRADA
-    # ==================================================================================
-
-    print_header(
-        "9. CLASSIFICAÇÃO DE ENTRADA"
-    )
-
-    ranking = (
-        classify_portfolio_entries(
-            portfolio=portfolio,
-            prices=prices,
-            historical_valuation=historical_valuation,
-        )
-    )
-
-    audit = (
-        audit_entry_ranking(
-            ranking
-        )
-    )
-
-    print(
-        "\nAuditoria:"
-    )
-
-    print(
-        f"  Ações               : "
-        f"{audit['number_of_stocks']}"
-    )
-
-    print(
-        f"  Setores              : "
-        f"{audit['number_of_sectors']}"
-    )
-
-    print(
-        f"  Entrada Forte        : "
-        f"{audit['entry_strong']}"
-    )
-
-    print(
-        f"  Entrada              : "
-        f"{audit['entry']}"
-    )
-
-    print(
-        f"  Aguardar             : "
-        f"{audit['wait']}"
-    )
-
-    print(
-        f"  Não comprar agora    : "
-        f"{audit['do_not_buy']}"
-    )
-
-    print(
-        f"  Estrutura OK         : "
-        f"{audit['structure_ok']}"
-    )
-
-    if not audit[
-        "structure_ok"
-    ]:
-
-        raise RuntimeError(
-            "Auditoria final da carteira falhou."
-        )
-
-    # ==================================================================================
-    # RESULTADO NO TERMINAL
-    # ==================================================================================
-
-    print_header(
-        "10. RANKING FINAL"
-    )
-
-    columns_to_show = [
-        col
-        for col in [
+    columns = [
+        c for c in [
             "sector",
             "buy_priority_sector",
             "ticker",
@@ -454,90 +156,38 @@ def run():
             "valuation_status",
             "discount_status",
             "fundamental_status",
+            "relative_valuation_score",
+            "price_discount_score",
+            "fundamental_preservation_score",
             "final_signal_score",
             "signal_percentile",
             "entry_signal",
         ]
-        if col in ranking.columns
+        if c in ranking.columns
     ]
 
-    print(
-        ranking[
-            columns_to_show
-        ]
-        .to_string(
-            index=False
-        )
+    print(ranking[columns].to_string(index=False))
+
+    # 11. RELATÓRIOS
+    print_header("11. RELATÓRIOS")
+    files = generate_reports(
+        ranking=ranking,
+        generated_at=started_at,
     )
 
-    # ==================================================================================
-    # RELATÓRIOS
-    # ==================================================================================
+    for name, path in files.items():
+        print(f"{name:<22}: {path}")
 
-    print_header(
-        "11. RELATÓRIOS"
-    )
+    finished_at = datetime.now()
 
-    report_files = (
-        generate_reports(
-            ranking=ranking,
-            generated_at=started_at,
-        )
-    )
-
-    for name, path in (
-        report_files.items()
-    ):
-
-        print(
-            f"{name:<22}: "
-            f"{path}"
-        )
-
-    # ==================================================================================
-    # FINAL
-    # ==================================================================================
-
-    finished_at = (
-        datetime.now()
-    )
-
-    elapsed = (
-        finished_at
-        -
-        started_at
-    )
-
-    print_header(
-        "EXECUÇÃO CONCLUÍDA"
-    )
-
-    print(
-        f"Início          : "
-        f"{started_at.strftime('%d/%m/%Y %H:%M:%S')}"
-    )
-
-    print(
-        f"Fim             : "
-        f"{finished_at.strftime('%d/%m/%Y %H:%M:%S')}"
-    )
-
-    print(
-        f"Tempo total     : "
-        f"{elapsed}"
-    )
-
-    print(
-        "\nSTATUS: SUCESSO"
-    )
+    print_header("EXECUÇÃO CONCLUÍDA")
+    print(f"Início          : {started_at.strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"Fim             : {finished_at.strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"Tempo total     : {finished_at - started_at}")
+    print("\nSTATUS: SUCESSO")
 
     return ranking
 
 
-# ======================================================================================
-# 4. EXECUÇÃO
-# ======================================================================================
-
 if __name__ == "__main__":
-
     run()
