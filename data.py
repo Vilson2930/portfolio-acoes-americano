@@ -181,36 +181,63 @@ SP500_URL = (
 def get_sp500_universe(
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """
-    Universo corrente do S&P 500.
 
-    A tabela já fornece ticker, empresa, GICS sector e CIK.
-    Isso evita depender do company_tickers.json da SEC para montar
-    o universo e elimina milhares de consultas de setor via yfinance.
-    """
+    cache_file = (
+        CACHE_PATH
+        /
+        "sp500_universe.parquet"
+    )
 
-    cache_file = CACHE_PATH / "sp500_universe.parquet"
+    if (
+        cache_file.exists()
+        and
+        not force_refresh
+    ):
 
-    if cache_file.exists() and not force_refresh:
         try:
-            cached = pd.read_parquet(cache_file)
-            required = {"ticker", "cik", "company_name", "sector"}
-            if not cached.empty and required.issubset(cached.columns):
+
+            cached = pd.read_parquet(
+                cache_file
+            )
+
+            required = {
+                "ticker",
+                "cik",
+                "company_name",
+                "sector",
+            }
+
+            if (
+                not cached.empty
+                and
+                required.issubset(
+                    cached.columns
+                )
+            ):
+
                 return cached
+
         except Exception:
             pass
 
-    response = requests.get(
-        SP500_URL,
-        headers={"User-Agent": "Mozilla/5.0 portfolio-acoes-americano/1.0"},
-        timeout=30,
+    print(
+        "Baixando universo atual do S&P 500..."
     )
-    response.raise_for_status()
 
-    tables = pd.read_html(response.text)
+    # Leitura direta da página.
+    # Evita passar response.text bruto ao pandas.
+    tables = pd.read_html(
+        SP500_URL,
+        attrs={
+            "id": "constituents"
+        },
+    )
 
     if not tables:
-        raise RuntimeError("Tabela do S&P 500 não encontrada.")
+
+        raise RuntimeError(
+            "Tabela do S&P 500 não encontrada."
+        )
 
     raw = tables[0].copy()
 
@@ -221,24 +248,52 @@ def get_sp500_universe(
         "CIK",
     }
 
-    if not required_source.issubset(raw.columns):
+    if not required_source.issubset(
+        raw.columns
+    ):
+
         raise RuntimeError(
             "Tabela S&P 500 sem as colunas esperadas."
         )
 
     universe = pd.DataFrame(
         {
-            "ticker": raw["Symbol"].map(normalize_ticker),
-            "company_name": raw["Security"].astype(str).str.strip(),
-            "sector": raw["GICS Sector"].astype(str).str.strip(),
-            "cik": pd.to_numeric(raw["CIK"], errors="coerce"),
+            "ticker":
+                raw["Symbol"]
+                .map(
+                    normalize_ticker
+                ),
+
+            "company_name":
+                raw["Security"]
+                .astype(str)
+                .str.strip(),
+
+            "sector":
+                raw["GICS Sector"]
+                .astype(str)
+                .str.strip(),
+
+            "cik":
+                pd.to_numeric(
+                    raw["CIK"],
+                    errors="coerce",
+                ),
         }
     )
 
-    universe = universe[universe["cik"].notna()].copy()
+    universe = universe[
+        universe[
+            "cik"
+        ].notna()
+    ].copy()
 
-    universe["cik"] = (
-        universe["cik"]
+    universe[
+        "cik"
+    ] = (
+        universe[
+            "cik"
+        ]
         .astype("int64")
         .astype(str)
         .str.zfill(10)
@@ -246,17 +301,35 @@ def get_sp500_universe(
 
     universe = (
         universe
-        .drop_duplicates(subset=["ticker"])
-        .sort_values("ticker")
-        .reset_index(drop=True)
+        .drop_duplicates(
+            subset=[
+                "ticker"
+            ]
+        )
+        .sort_values(
+            "ticker"
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
     if len(universe) < 450:
+
         raise RuntimeError(
-            f"Universo S&P 500 insuficiente: {len(universe)} empresas."
+            f"Universo S&P 500 insuficiente: "
+            f"{len(universe)} empresas."
         )
 
-    universe.to_parquet(cache_file, index=False)
+    universe.to_parquet(
+        cache_file,
+        index=False,
+    )
+
+    print(
+        f"Universo S&P 500 carregado: "
+        f"{len(universe)} empresas."
+    )
 
     return universe
 
