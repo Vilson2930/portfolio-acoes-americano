@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
@@ -67,12 +68,19 @@ CACHE_PATH.mkdir(
 # 2. HTTP
 # ======================================================================================
 
+DECLARED_SEC_USER_AGENT = os.getenv(
+    "SEC_USER_AGENT",
+    SEC_USER_AGENT,
+).strip()
+
 SESSION = requests.Session()
 
 SESSION.headers.update(
     {
-        "User-Agent": SEC_USER_AGENT,
+        "User-Agent": DECLARED_SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
     }
 )
 
@@ -81,76 +89,34 @@ SESSION.headers.update(
 # 3. HELPERS
 # ======================================================================================
 
-def normalize_ticker(
-    ticker: str,
-) -> str:
-
-    return (
-        str(ticker)
-        .upper()
-        .strip()
-        .replace(".", "-")
-    )
+def normalize_ticker(ticker: str) -> str:
+    return str(ticker).upper().strip().replace(".", "-")
 
 
-def safe_numeric(
-    value,
-):
-
+def safe_numeric(value):
     try:
-
         value = float(value)
-
         if np.isfinite(value):
             return value
-
     except Exception:
         pass
-
     return np.nan
 
 
-def safe_growth(
-    current,
-    previous,
-):
-    """
-    Crescimento simples:
-
-        current / previous - 1
-
-    Retorna NaN quando o denominador não é utilizável.
-    """
-
-    current = safe_numeric(
-        current
-    )
-
-    previous = safe_numeric(
-        previous
-    )
+def safe_growth(current, previous):
+    current = safe_numeric(current)
+    previous = safe_numeric(previous)
 
     if (
         not np.isfinite(current)
-        or
-        not np.isfinite(previous)
-        or
-        previous == 0
+        or not np.isfinite(previous)
+        or previous == 0
     ):
         return np.nan
 
-    result = (
-        current
-        /
-        previous
-        -
-        1.0
-    )
+    result = current / previous - 1.0
 
-    if not np.isfinite(result):
-        return np.nan
-
-    return result
+    return result if np.isfinite(result) else np.nan
 
 
 # ======================================================================================
@@ -159,186 +125,214 @@ def safe_growth(
 
 def request_json(
     url: str,
-    retries: int = 3,
-    sleep_seconds: float = 0.30,
+    retries: int = 4,
+    sleep_seconds: float = 0.75,
 ):
+    """
+    Requisição JSON com backoff e headers adequados para a SEC.
+    """
 
     last_error = None
 
-    for attempt in range(
-        retries
-    ):
-
+    for attempt in range(retries):
         try:
+            headers = {
+                "User-Agent": DECLARED_SEC_USER_AGENT,
+                "Accept-Encoding": "gzip, deflate",
+                "Accept": "application/json,text/plain,*/*",
+            }
 
             response = SESSION.get(
                 url,
+                headers=headers,
                 timeout=30,
             )
 
-            response.raise_for_status()
+            if response.status_code in (403, 429):
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code} para {url}"
+                )
+                time.sleep(max(2.0, sleep_seconds * (attempt + 1) * 2))
+                continue
 
+            response.raise_for_status()
             return response.json()
 
         except Exception as exc:
-
             last_error = exc
-
             if attempt < retries - 1:
-
-                time.sleep(
-                    sleep_seconds
-                    *
-                    (attempt + 1)
-                )
+                time.sleep(sleep_seconds * (attempt + 1))
 
     raise RuntimeError(
-        f"Falha ao acessar {url}: "
-        f"{last_error}"
+        f"Falha ao acessar {url}: {last_error}"
     )
 
 
 # ======================================================================================
-# 5. MAPA OFICIAL TICKER -> CIK
+# 5. UNIVERSO S&P 500 — BASE OPERACIONAL
+# ======================================================================================
+
+SP500_URL = (
+    "https://en.wikipedia.org/wiki/"
+    "List_of_S%26P_500_companies"
+)
+
+
+def get_sp500_universe(
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """
+    Universo corrente do S&P 500.
+
+    A tabela já fornece ticker, empresa, GICS sector e CIK.
+    Isso evita depender do company_tickers.json da SEC para montar
+    o universo e elimina milhares de consultas de setor via yfinance.
+    """
+
+    cache_file = CACHE_PATH / "sp500_universe.parquet"
+
+    if cache_file.exists() and not force_refresh:
+        try:
+            cached = pd.read_parquet(cache_file)
+            required = {"ticker", "cik", "company_name", "sector"}
+            if not cached.empty and required.issubset(cached.columns):
+                return cached
+        except Exception:
+            pass
+
+    response = requests.get(
+        SP500_URL,
+        headers={"User-Agent": "Mozilla/5.0 portfolio-acoes-americano/1.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    tables = pd.read_html(response.text)
+
+    if not tables:
+        raise RuntimeError("Tabela do S&P 500 não encontrada.")
+
+    raw = tables[0].copy()
+
+    required_source = {
+        "Symbol",
+        "Security",
+        "GICS Sector",
+        "CIK",
+    }
+
+    if not required_source.issubset(raw.columns):
+        raise RuntimeError(
+            "Tabela S&P 500 sem as colunas esperadas."
+        )
+
+    universe = pd.DataFrame(
+        {
+            "ticker": raw["Symbol"].map(normalize_ticker),
+            "company_name": raw["Security"].astype(str).str.strip(),
+            "sector": raw["GICS Sector"].astype(str).str.strip(),
+            "cik": pd.to_numeric(raw["CIK"], errors="coerce"),
+        }
+    )
+
+    universe = universe[universe["cik"].notna()].copy()
+
+    universe["cik"] = (
+        universe["cik"]
+        .astype("int64")
+        .astype(str)
+        .str.zfill(10)
+    )
+
+    universe = (
+        universe
+        .drop_duplicates(subset=["ticker"])
+        .sort_values("ticker")
+        .reset_index(drop=True)
+    )
+
+    if len(universe) < 450:
+        raise RuntimeError(
+            f"Universo S&P 500 insuficiente: {len(universe)} empresas."
+        )
+
+    universe.to_parquet(cache_file, index=False)
+
+    return universe
+
+
+# ======================================================================================
+# 6. MAPA OFICIAL TICKER -> CIK — FALLBACK / AUDITORIA
 # ======================================================================================
 
 def get_sec_ticker_map(
     force_refresh: bool = False,
 ) -> pd.DataFrame:
+    """
+    Mantido para auditoria. Não é mais obrigatório
+    para construir o universo diário.
+    """
 
-    cache_file = (
-        CACHE_PATH
-        /
-        "sec_ticker_map.parquet"
-    )
+    cache_file = CACHE_PATH / "sec_ticker_map.parquet"
 
-    if (
-        cache_file.exists()
-        and
-        not force_refresh
-    ):
-
+    if cache_file.exists() and not force_refresh:
         try:
-
-            cached = pd.read_parquet(
-                cache_file
-            )
-
+            cached = pd.read_parquet(cache_file)
             if not cached.empty:
                 return cached
-
         except Exception:
             pass
 
-    data = request_json(
-        SEC_TICKER_MAP_URL
-    )
+    data = request_json(SEC_TICKER_MAP_URL)
 
     rows = []
 
     for item in data.values():
+        ticker = normalize_ticker(item.get("ticker", ""))
+        cik = item.get("cik_str")
+        title = item.get("title")
 
-        ticker = normalize_ticker(
-            item.get(
-                "ticker",
-                "",
-            )
-        )
-
-        cik = item.get(
-            "cik_str"
-        )
-
-        title = item.get(
-            "title"
-        )
-
-        if (
-            not ticker
-            or
-            cik is None
-        ):
+        if not ticker or cik is None:
             continue
 
         rows.append(
             {
-                "ticker":
-                    ticker,
-
-                "cik":
-                    str(
-                        int(cik)
-                    ).zfill(10),
-
-                "company_name":
-                    title,
+                "ticker": ticker,
+                "cik": str(int(cik)).zfill(10),
+                "company_name": title,
             }
         )
 
-    df = pd.DataFrame(
-        rows
-    )
+    df = pd.DataFrame(rows)
 
     if df.empty:
-
         raise RuntimeError(
             "Mapa ticker/CIK da SEC retornou vazio."
         )
 
     df = (
         df
-        .drop_duplicates(
-            subset=[
-                "ticker"
-            ]
-        )
-        .sort_values(
-            "ticker"
-        )
-        .reset_index(
-            drop=True
-        )
+        .drop_duplicates(subset=["ticker"])
+        .sort_values("ticker")
+        .reset_index(drop=True)
     )
 
-    df.to_parquet(
-        cache_file,
-        index=False,
-    )
+    df.to_parquet(cache_file, index=False)
 
     return df
 
 
 # ======================================================================================
-# 6. UNIVERSO BASE
+# 7. UNIVERSO BASE
 # ======================================================================================
 
 def build_base_universe() -> pd.DataFrame:
+    universe = get_sp500_universe().copy()
 
-    sec_map = (
-        get_sec_ticker_map()
-    )
-
-    universe = (
-        sec_map[
-            [
-                "ticker",
-                "cik",
-                "company_name",
-            ]
-        ]
-        .copy()
-    )
+    universe = universe[universe["ticker"].notna()]
 
     universe = universe[
-        universe[
-            "ticker"
-        ].notna()
-    ]
-
-    universe = universe[
-        ~universe[
-            "ticker"
-        ].str.contains(
+        ~universe["ticker"].str.contains(
             r"[\^/]",
             regex=True,
             na=False,
@@ -347,136 +341,62 @@ def build_base_universe() -> pd.DataFrame:
 
     return (
         universe
-        .drop_duplicates(
-            subset=[
-                "ticker"
-            ]
-        )
-        .reset_index(
-            drop=True
-        )
+        .drop_duplicates(subset=["ticker"])
+        .reset_index(drop=True)
     )
 
 
 # ======================================================================================
-# 7. SETORES
+# 8. SETORES
 # ======================================================================================
 
 def get_ticker_sector(
     ticker: str,
 ) -> Optional[str]:
+    """
+    Fallback individual. Normalmente não é usado,
+    porque o S&P 500 já fornece o GICS sector.
+    """
 
-    ticker = normalize_ticker(
-        ticker
-    )
+    ticker = normalize_ticker(ticker)
 
     try:
-
-        obj = yf.Ticker(
-            ticker
-        )
-
-        # fast_info não fornece setor.
-        # get_info continua sendo usado somente quando necessário.
-
-        info = obj.get_info()
-
-        sector = info.get(
-            "sector"
-        )
-
+        info = yf.Ticker(ticker).get_info()
+        sector = info.get("sector")
         if sector is None:
             return None
-
-        return str(
-            sector
-        ).strip()
-
+        return str(sector).strip()
     except Exception:
-
         return None
 
 
 def load_sector_cache() -> pd.DataFrame:
-
-    cache_file = (
-        CACHE_PATH
-        /
-        "ticker_sectors.parquet"
-    )
+    cache_file = CACHE_PATH / "ticker_sectors.parquet"
 
     if not cache_file.exists():
-
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "sector",
-            ]
-        )
+        return pd.DataFrame(columns=["ticker", "sector"])
 
     try:
+        df = pd.read_parquet(cache_file)
+        if "ticker" not in df.columns or "sector" not in df.columns:
+            return pd.DataFrame(columns=["ticker", "sector"])
 
-        df = pd.read_parquet(
-            cache_file
-        )
-
-        if (
-            "ticker" not in df.columns
-            or
-            "sector" not in df.columns
-        ):
-
-            return pd.DataFrame(
-                columns=[
-                    "ticker",
-                    "sector",
-                ]
-            )
-
-        df["ticker"] = (
-            df["ticker"]
-            .map(
-                normalize_ticker
-            )
-        )
+        df["ticker"] = df["ticker"].map(normalize_ticker)
 
         return (
             df
-            .drop_duplicates(
-                subset=[
-                    "ticker"
-                ],
-                keep="last",
-            )
-            .reset_index(
-                drop=True
-            )
+            .drop_duplicates(subset=["ticker"], keep="last")
+            .reset_index(drop=True)
         )
-
     except Exception:
-
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "sector",
-            ]
-        )
+        return pd.DataFrame(columns=["ticker", "sector"])
 
 
 def save_sector_cache(
     sectors: pd.DataFrame,
 ):
-
-    cache_file = (
-        CACHE_PATH
-        /
-        "ticker_sectors.parquet"
-    )
-
-    sectors.to_parquet(
-        cache_file,
-        index=False,
-    )
+    cache_file = CACHE_PATH / "ticker_sectors.parquet"
+    sectors.to_parquet(cache_file, index=False)
 
 
 def enrich_sectors(
@@ -485,141 +405,77 @@ def enrich_sectors(
     sleep_seconds: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Acrescenta setor ao universo.
-
-    O cache evita consultar yfinance para todos os
-    tickers em todas as execuções.
+    Usa o setor já existente no universo.
+    Só consulta yfinance se algum ticker vier sem setor.
     """
 
     df = universe.copy()
+    df["ticker"] = df["ticker"].map(normalize_ticker)
 
-    df["ticker"] = (
-        df["ticker"]
-        .map(
-            normalize_ticker
+    if "sector" not in df.columns:
+        df["sector"] = np.nan
+
+    missing_mask = (
+        df["sector"].isna()
+        |
+        df["sector"].astype(str).str.strip().isin(
+            ["", "nan", "None"]
         )
     )
 
-    cache = (
-        load_sector_cache()
-    )
+    if not missing_mask.any():
+        return df
+
+    cache = load_sector_cache()
 
     cache_map = {}
-
     if not cache.empty:
+        cache_map = dict(zip(cache["ticker"], cache["sector"]))
 
-        cache_map = dict(
-            zip(
-                cache[
-                    "ticker"
-                ],
-                cache[
-                    "sector"
-                ],
-            )
-        )
+    updated_rows = []
 
-    sector_rows = []
+    missing_indices = df.index[missing_mask].tolist()
+    total = len(missing_indices)
 
-    total = len(df)
-
-    for number, ticker in enumerate(
-        df["ticker"],
-        start=1,
-    ):
+    for number, idx in enumerate(missing_indices, start=1):
+        ticker = df.at[idx, "ticker"]
 
         if (
             not force_refresh
-            and
-            ticker in cache_map
-            and
-            pd.notna(
-                cache_map[ticker]
-            )
+            and ticker in cache_map
+            and pd.notna(cache_map[ticker])
         ):
-
-            sector = (
-                cache_map[
-                    ticker
-                ]
-            )
-
+            sector = cache_map[ticker]
         else:
+            sector = get_ticker_sector(ticker)
+            time.sleep(sleep_seconds)
 
-            sector = (
-                get_ticker_sector(
-                    ticker
-                )
-            )
+        df.at[idx, "sector"] = sector
 
-            time.sleep(
-                sleep_seconds
-            )
-
-        sector_rows.append(
-            {
-                "ticker":
-                    ticker,
-
-                "sector":
-                    sector,
-            }
+        updated_rows.append(
+            {"ticker": ticker, "sector": sector}
         )
 
-        if (
-            number % 100 == 0
-            or
-            number == total
-        ):
-
+        if number % 25 == 0 or number == total:
             print(
-                f"Setores: "
-                f"{number:,}/{total:,}"
+                f"Setores faltantes: {number:,}/{total:,}"
             )
 
-    sectors = pd.DataFrame(
-        sector_rows
-    )
+    if updated_rows:
+        updated = pd.DataFrame(updated_rows)
 
-    # Atualizar cache
-
-    combined_cache = pd.concat(
-        [
-            cache,
-            sectors,
-        ],
-        ignore_index=True,
-    )
-
-    combined_cache = (
-        combined_cache
-        .drop_duplicates(
-            subset=[
-                "ticker"
-            ],
-            keep="last",
+        combined_cache = pd.concat(
+            [cache, updated],
+            ignore_index=True,
         )
-        .reset_index(
-            drop=True
+
+        combined_cache = (
+            combined_cache
+            .drop_duplicates(subset=["ticker"], keep="last")
+            .reset_index(drop=True)
         )
-    )
 
-    save_sector_cache(
-        combined_cache
-    )
-
-    df = df.drop(
-        columns=[
-            "sector"
-        ],
-        errors="ignore",
-    )
-
-    df = df.merge(
-        sectors,
-        on="ticker",
-        how="left",
-    )
+        save_sector_cache(combined_cache)
 
     return df
 
@@ -629,29 +485,18 @@ def filter_target_sectors(
 ) -> pd.DataFrame:
 
     if "sector" not in universe.columns:
-
         raise ValueError(
             "A coluna 'sector' não existe no universo."
         )
 
     df = universe[
-        universe[
-            "sector"
-        ].isin(
-            SECTORS
-        )
+        universe["sector"].isin(SECTORS)
     ].copy()
 
     return (
         df
-        .drop_duplicates(
-            subset=[
-                "ticker"
-            ]
-        )
-        .reset_index(
-            drop=True
-        )
+        .drop_duplicates(subset=["ticker"])
+        .reset_index(drop=True)
     )
 
 
@@ -797,9 +642,7 @@ def get_company_facts(
     use_cache: bool = True,
 ) -> Dict:
 
-    cik = str(
-        cik
-    ).zfill(10)
+    cik = str(cik).zfill(10)
 
     cache_file = (
         CACHE_PATH
@@ -807,24 +650,14 @@ def get_company_facts(
         f"companyfacts_{cik}.json"
     )
 
-    if (
-        use_cache
-        and
-        cache_file.exists()
-    ):
-
+    if use_cache and cache_file.exists():
         try:
-
             with open(
                 cache_file,
                 "r",
                 encoding="utf-8",
             ) as file:
-
-                return json.load(
-                    file
-                )
-
+                return json.load(file)
         except Exception:
             pass
 
@@ -833,28 +666,28 @@ def get_company_facts(
         f"CIK{cik}.json"
     )
 
-    headers = {
-        "User-Agent":
-            SEC_USER_AGENT,
-
-        "Accept-Encoding":
-            "gzip, deflate",
-    }
-
     last_error = None
 
-    for attempt in range(3):
-
+    for attempt in range(4):
         try:
-
-            response = requests.get(
+            response = SESSION.get(
                 url,
-                headers=headers,
+                headers={
+                    "User-Agent": DECLARED_SEC_USER_AGENT,
+                    "Accept-Encoding": "gzip, deflate",
+                    "Accept": "application/json,text/plain,*/*",
+                },
                 timeout=30,
             )
 
-            response.raise_for_status()
+            if response.status_code in (403, 429):
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code}"
+                )
+                time.sleep(2.0 * (attempt + 1))
+                continue
 
+            response.raise_for_status()
             data = response.json()
 
             with open(
@@ -862,27 +695,14 @@ def get_company_facts(
                 "w",
                 encoding="utf-8",
             ) as file:
+                json.dump(data, file)
 
-                json.dump(
-                    data,
-                    file,
-                )
-
-            time.sleep(
-                0.12
-            )
-
+            time.sleep(0.20)
             return data
 
         except Exception as exc:
-
             last_error = exc
-
-            time.sleep(
-                0.5
-                *
-                (attempt + 1)
-            )
+            time.sleep(1.0 * (attempt + 1))
 
     raise RuntimeError(
         f"SEC Company Facts indisponível "
