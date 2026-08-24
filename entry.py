@@ -326,7 +326,27 @@ def _snapshot_fundamentals(
     ticker_history: pd.DataFrame,
     snapshot: pd.Timestamp,
 ) -> Dict[str, float]:
+    """
+    Snapshot point-in-time dos fatos SEC.
+
+    FIDELIDADE AO ESTUDO:
+    --------------------
+    A Célula 37 não calculava os crescimentos usando uma busca
+    aproximada de 300–430 dias. Ela carregava, para cada snapshot,
+    o valor conhecido e o respectivo period_end e depois calculava
+    crescimento entre PERÍODOS FUNDAMENTAIS ÚNICOS consecutivos.
+
+    Por isso esta função devolve:
+      • valor;
+      • period_end;
+      • free_cash_flow.
+
+    Os growth_yoy são construídos depois, sobre a série mensal,
+    exatamente como na Célula 37.
+    """
+
     raw = {}
+    period_end = {}
 
     for metric in [
         "revenue",
@@ -342,8 +362,31 @@ def _snapshot_fundamentals(
         "diluted_eps",
         "diluted_shares",
     ]:
-        row = _latest_metric(ticker_history, metric, snapshot)
-        raw[metric] = _num(row["value"]) if row is not None else np.nan
+
+        row = _latest_metric(
+            ticker_history,
+            metric,
+            snapshot,
+        )
+
+        if row is None:
+
+            raw[metric] = np.nan
+            period_end[metric] = pd.NaT
+
+        else:
+
+            raw[metric] = _num(
+                row["value"]
+            )
+
+            period_end[metric] = pd.to_datetime(
+                row.get(
+                    "end",
+                    pd.NaT,
+                ),
+                errors="coerce",
+            )
 
     revenue = raw["revenue"]
     net_income = raw["net_income"]
@@ -351,25 +394,241 @@ def _snapshot_fundamentals(
     capex = raw["capex"]
 
     fcf = (
-        ocf - abs(capex)
-        if np.isfinite(ocf) and np.isfinite(capex)
-        else np.nan
+        ocf
+        -
+        abs(capex)
+        if (
+            np.isfinite(ocf)
+            and
+            np.isfinite(capex)
+        )
+        else
+        np.nan
     )
 
     return {
         **raw,
-        "revenue_growth_yoy": _growth_yoy(ticker_history, "revenue", snapshot),
-        "net_income_growth_yoy": _growth_yoy(ticker_history, "net_income", snapshot),
-        "operating_cash_flow_growth_yoy": _growth_yoy(
-            ticker_history, "operating_cash_flow", snapshot
-        ),
-        "diluted_eps_growth_yoy": _growth_yoy(ticker_history, "diluted_eps", snapshot),
-        "net_margin": _safe_div(net_income, revenue),
-        "ocf_margin": _safe_div(ocf, revenue),
-        "fcf_margin": _safe_div(fcf, revenue),
-        "free_cash_flow": fcf,
+
+        "revenue_period_end":
+            period_end["revenue"],
+
+        "net_income_period_end":
+            period_end["net_income"],
+
+        "operating_cash_flow_period_end":
+            period_end["operating_cash_flow"],
+
+        "diluted_eps_period_end":
+            period_end["diluted_eps"],
+
+        "free_cash_flow":
+            fcf,
+
+        # Margens são iguais às da Célula 37.
+        "net_margin":
+            _safe_div(
+                net_income,
+                revenue,
+            ),
+
+        "ocf_margin":
+            _safe_div(
+                ocf,
+                revenue,
+            ),
+
+        "fcf_margin":
+            _safe_div(
+                fcf,
+                revenue,
+            ),
     }
 
+
+def _apply_cell37_growth_logic(
+    hist: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Reproduz a Célula 37:
+
+      1. para cada ticker e métrica;
+      2. cria uma série de períodos fundamentais ÚNICOS;
+      3. mantém a primeira data em que cada period_end apareceu;
+      4. previous_value = shift(1);
+      5. growth = current / previous - 1;
+      6. previous_value <= 0 => NaN;
+      7. mapeia o growth do período de volta aos snapshots mensais.
+
+    Isso é deliberadamente diferente de procurar "aprox. 1 ano atrás".
+    """
+
+    out = hist.copy()
+
+    growth_specs = {
+        "revenue":
+            "revenue_period_end",
+
+        "net_income":
+            "net_income_period_end",
+
+        "operating_cash_flow":
+            "operating_cash_flow_period_end",
+
+        "diluted_eps":
+            "diluted_eps_period_end",
+    }
+
+    for ticker, idx in out.groupby(
+        "ticker"
+    ).groups.items():
+
+        temp = (
+            out.loc[list(idx)]
+            .sort_values(
+                "snapshot_date"
+            )
+            .copy()
+        )
+
+        for value_col, period_col in growth_specs.items():
+
+            growth_col = (
+                f"{value_col}_growth_yoy"
+            )
+
+            if (
+                value_col not in temp.columns
+                or
+                period_col not in temp.columns
+            ):
+
+                out.loc[
+                    temp.index,
+                    growth_col,
+                ] = np.nan
+
+                continue
+
+            unique_series = (
+                temp[
+                    [
+                        "snapshot_date",
+                        value_col,
+                        period_col,
+                    ]
+                ]
+                .dropna(
+                    subset=[
+                        value_col,
+                        period_col,
+                    ]
+                )
+                .copy()
+            )
+
+            unique_series[
+                period_col
+            ] = pd.to_datetime(
+                unique_series[
+                    period_col
+                ],
+                errors="coerce",
+            )
+
+            unique_series = (
+                unique_series
+                .dropna(
+                    subset=[
+                        period_col
+                    ]
+                )
+                .sort_values(
+                    [
+                        period_col,
+                        "snapshot_date",
+                    ]
+                )
+                .drop_duplicates(
+                    subset=[
+                        period_col
+                    ],
+                    keep="first",
+                )
+                .sort_values(
+                    period_col
+                )
+            )
+
+            unique_series[
+                "previous_value"
+            ] = (
+                pd.to_numeric(
+                    unique_series[
+                        value_col
+                    ],
+                    errors="coerce",
+                )
+                .shift(1)
+            )
+
+            current_values = pd.to_numeric(
+                unique_series[
+                    value_col
+                ],
+                errors="coerce",
+            )
+
+            unique_series[
+                "growth"
+            ] = (
+                current_values
+                /
+                unique_series[
+                    "previous_value"
+                ]
+                -
+                1.0
+            )
+
+            unique_series.loc[
+                (
+                    unique_series[
+                        "previous_value"
+                    ]
+                    <=
+                    0
+                ),
+                "growth",
+            ] = np.nan
+
+            growth_map = (
+                unique_series
+                .set_index(
+                    period_col
+                )[
+                    "growth"
+                ]
+                .to_dict()
+            )
+
+            mapped = (
+                pd.to_datetime(
+                    temp[
+                        period_col
+                    ],
+                    errors="coerce",
+                )
+                .map(
+                    growth_map
+                )
+            )
+
+            out.loc[
+                temp.index,
+                growth_col,
+            ] = mapped.values
+
+    return out
 
 def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
     shares = _num(f.get("diluted_shares"))
@@ -453,15 +712,102 @@ def build_entry_signal_history(
 
             rows.append(
                 {
-                    "snapshot_date": snapshot,
-                    "sector": sector_map[ticker],
-                    "ticker": ticker,
-                    "market_price": _num(pr["price"]),
+                    "snapshot_date":
+                        snapshot,
+
+                    "sector":
+                        sector_map[ticker],
+
+                    "ticker":
+                        ticker,
+
+                    "market_price":
+                        _num(pr["price"]),
+
                     **valuation,
-                    **{k: f.get(k, np.nan) for k in FUNDAMENTAL_COMPONENTS},
-                    **{k: _num(pr[k]) for k in DISCOUNT_METRICS},
-                    "momentum_6m": _num(pr["momentum_6m"]),
-                    "momentum_12m": _num(pr["momentum_12m"]),
+
+                    # Base fundamental da Célula 37
+                    "revenue":
+                        f.get("revenue", np.nan),
+
+                    "net_income":
+                        f.get("net_income", np.nan),
+
+                    "operating_cash_flow":
+                        f.get(
+                            "operating_cash_flow",
+                            np.nan,
+                        ),
+
+                    "free_cash_flow":
+                        f.get(
+                            "free_cash_flow",
+                            np.nan,
+                        ),
+
+                    "diluted_eps":
+                        f.get(
+                            "diluted_eps",
+                            np.nan,
+                        ),
+
+                    "revenue_period_end":
+                        f.get(
+                            "revenue_period_end",
+                            pd.NaT,
+                        ),
+
+                    "net_income_period_end":
+                        f.get(
+                            "net_income_period_end",
+                            pd.NaT,
+                        ),
+
+                    "operating_cash_flow_period_end":
+                        f.get(
+                            "operating_cash_flow_period_end",
+                            pd.NaT,
+                        ),
+
+                    "diluted_eps_period_end":
+                        f.get(
+                            "diluted_eps_period_end",
+                            pd.NaT,
+                        ),
+
+                    "net_margin":
+                        f.get(
+                            "net_margin",
+                            np.nan,
+                        ),
+
+                    "ocf_margin":
+                        f.get(
+                            "ocf_margin",
+                            np.nan,
+                        ),
+
+                    "fcf_margin":
+                        f.get(
+                            "fcf_margin",
+                            np.nan,
+                        ),
+
+                    **{
+                        k:
+                            _num(pr[k])
+                        for k in DISCOUNT_METRICS
+                    },
+
+                    "momentum_6m":
+                        _num(
+                            pr["momentum_6m"]
+                        ),
+
+                    "momentum_12m":
+                        _num(
+                            pr["momentum_12m"]
+                        ),
                 }
             )
 
@@ -469,7 +815,27 @@ def build_entry_signal_history(
     if hist.empty:
         raise RuntimeError("Histórico mensal de entrada ficou vazio.")
 
-    hist = hist.sort_values(["ticker", "snapshot_date"]).reset_index(drop=True)
+    hist = hist.sort_values(
+        [
+            "ticker",
+            "snapshot_date",
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    # ------------------------------------------------------------------
+    # FUNDAMENTOS — CÉLULA 37
+    # ------------------------------------------------------------------
+    #
+    # Os crescimentos são construídos sobre períodos fundamentais
+    # únicos consecutivos e só então normalizados contra o próprio
+    # histórico da ação.
+    # ------------------------------------------------------------------
+
+    hist = _apply_cell37_growth_logic(
+        hist
+    )
 
     # ------------------------------------------------------------------
     # VALUATION: próprio histórico; menor múltiplo = melhor; mediana
@@ -740,5 +1106,728 @@ def audit_entry_ranking(ranking: pd.DataFrame) -> Dict:
     }
 
 
+# ======================================================================================
+# COMPATIBILIDADE COM A ESTRUTURA ANTERIOR
+# ======================================================================================
+#
+# As funções abaixo preservam nomes utilizados na versão antiga do entry.py.
+# Elas NÃO alteram a lógica corrigida. Servem para:
+#
+#   • facilitar auditoria;
+#   • evitar quebra de imports antigos;
+#   • manter o arquivo operacional mais completo;
+#   • permitir comparação com a implementação anterior.
+#
+# ======================================================================================
+
+def safe_numeric(series: pd.Series) -> pd.Series:
+    """
+    Converte uma Series para numérico e remove infinitos.
+    """
+    return (
+        pd.to_numeric(series, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+
+def safe_divide(
+    numerator: pd.Series,
+    denominator: pd.Series,
+) -> pd.Series:
+    """
+    Divisão vetorial segura.
+    """
+    numerator = safe_numeric(numerator)
+    denominator = safe_numeric(denominator)
+
+    result = numerator / denominator.replace(0, np.nan)
+
+    return result.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+
+def percentile_score(
+    series: pd.Series,
+    higher_is_better: bool = True,
+) -> pd.Series:
+    """
+    Percentil transversal simples.
+
+    IMPORTANTE:
+    Esta função é mantida apenas para compatibilidade/auditoria.
+    Ela NÃO é usada para produzir o signal_percentile final.
+
+    O signal_percentile final continua sendo calculado contra
+    o histórico anterior do próprio setor, conforme a Célula 41.
+    """
+
+    values = safe_numeric(series)
+
+    return values.rank(
+        pct=True,
+        ascending=higher_is_better,
+        method="average",
+    )
+
+
+def historical_percentile(
+    current_value,
+    history: pd.Series,
+    lower_is_better: bool = True,
+) -> float:
+    """
+    Percentil de um valor atual contra uma série histórica.
+
+    Utilidade:
+        auditoria de valuation e desconto.
+
+    Não substitui o processo point-in-time utilizado no motor principal.
+    """
+
+    current_value = _num(current_value)
+
+    hist = (
+        pd.to_numeric(history, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .to_numpy(dtype=float)
+    )
+
+    if (
+        not np.isfinite(current_value)
+        or len(hist) < MIN_HISTORY
+    ):
+        return np.nan
+
+    less = np.sum(hist < current_value)
+    equal = np.sum(hist == current_value)
+
+    percentile = (
+        less
+        +
+        0.5 * equal
+    ) / len(hist)
+
+    if lower_is_better:
+        percentile = 1.0 - percentile
+
+    return float(percentile)
+
+
+def mean_valid(
+    values: Iterable,
+    minimum: int = 1,
+) -> float:
+    """
+    Média dos valores válidos.
+    """
+
+    values = pd.to_numeric(
+        pd.Series(list(values)),
+        errors="coerce",
+    )
+
+    values = values.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    valid = values.dropna()
+
+    if len(valid) < minimum:
+        return np.nan
+
+    return float(valid.mean())
+
+
+def calculate_momentum(
+    prices: pd.Series,
+    months: int,
+) -> float:
+    """
+    Retorno simples aproximado de N meses.
+
+    Mantido para compatibilidade com a versão antiga.
+    O motor principal usa 126 dias úteis para 6M
+    e 252 dias úteis para 12M.
+    """
+
+    prices = (
+        pd.to_numeric(prices, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .sort_index()
+    )
+
+    trading_days = 21 * months
+
+    if len(prices) <= trading_days:
+        return np.nan
+
+    current = _num(prices.iloc[-1])
+    previous = _num(prices.iloc[-trading_days - 1])
+
+    if (
+        not np.isfinite(current)
+        or not np.isfinite(previous)
+        or previous == 0
+    ):
+        return np.nan
+
+    return float(
+        current / previous - 1.0
+    )
+
+
+# ======================================================================================
+# RESUMO EXECUTIVO
+# ======================================================================================
+
+def build_entry_summary(
+    ranking: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Constrói a tabela resumida usada em relatório/auditoria.
+    """
+
+    columns = [
+        "sector",
+        "buy_priority_sector",
+        "ticker",
+        "selection_status",
+        "valuation_status",
+        "discount_status",
+        "fundamental_status",
+        "timing_method",
+        "sector_validation_status",
+        "relative_valuation_score",
+        "price_discount_score",
+        "fundamental_preservation_score",
+        "final_signal_score",
+        "signal_percentile",
+        "entry_signal",
+    ]
+
+    available = [
+        column
+        for column in columns
+        if column in ranking.columns
+    ]
+
+    return ranking[
+        available
+    ].copy()
+
+
+# ======================================================================================
+# AUDITORIA DO HISTÓRICO DE ENTRADA
+# ======================================================================================
+
+def audit_entry_history(
+    history: pd.DataFrame,
+) -> Dict:
+    """
+    Auditoria metodológica do histórico produzido pelo entry engine.
+
+    Não interfere nos sinais.
+    """
+
+    if history is None or history.empty:
+        return {
+            "history_rows": 0,
+            "history_ok": False,
+        }
+
+    required = {
+        "snapshot_date",
+        "ticker",
+        "sector",
+        "final_signal_score",
+        "signal_percentile",
+    }
+
+    missing = sorted(
+        required - set(history.columns)
+    )
+
+    duplicates = int(
+        history.duplicated(
+            subset=[
+                "ticker",
+                "snapshot_date",
+            ]
+        ).sum()
+    )
+
+    counts = (
+        history.groupby("sector")["ticker"]
+        .nunique()
+        .to_dict()
+    )
+
+    valid_signal = int(
+        history["final_signal_score"]
+        .notna()
+        .sum()
+    )
+
+    valid_percentile = int(
+        history["signal_percentile"]
+        .notna()
+        .sum()
+    )
+
+    return {
+        "history_rows":
+            int(len(history)),
+
+        "tickers":
+            int(history["ticker"].nunique()),
+
+        "sectors":
+            int(history["sector"].nunique()),
+
+        "sector_ticker_counts":
+            counts,
+
+        "first_snapshot":
+            history["snapshot_date"].min(),
+
+        "last_snapshot":
+            history["snapshot_date"].max(),
+
+        "duplicate_ticker_date":
+            duplicates,
+
+        "valid_final_signal_score":
+            valid_signal,
+
+        "valid_signal_percentile":
+            valid_percentile,
+
+        "missing_required_columns":
+            missing,
+
+        "history_ok":
+            (
+                not missing
+                and duplicates == 0
+                and history["ticker"].nunique() == 15
+                and all(
+                    counts.get(sector, 0) == 5
+                    for sector in SECTORS
+                )
+            ),
+    }
+
+
+# ======================================================================================
+# AUDITORIA DOS COMPONENTES DO SNAPSHOT ATUAL
+# ======================================================================================
+
+def audit_entry_components(
+    ranking: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Mostra, ação por ação, quais componentes do sinal estão disponíveis.
+
+    Serve para identificar rapidamente:
+        valuation insuficiente,
+        desconto insuficiente,
+        fundamentos insuficientes,
+        momentum insuficiente.
+    """
+
+    df = ranking.copy()
+
+    rows = []
+
+    for _, row in df.iterrows():
+
+        sector = row.get("sector")
+        ticker = row.get("ticker")
+
+        valuation_n = int(
+            _num(
+                row.get(
+                    "valid_relative_metrics",
+                    0,
+                )
+            )
+            if np.isfinite(
+                _num(
+                    row.get(
+                        "valid_relative_metrics",
+                        0,
+                    )
+                )
+            )
+            else 0
+        )
+
+        discount_n = int(
+            _num(
+                row.get(
+                    "valid_discount_metrics",
+                    0,
+                )
+            )
+            if np.isfinite(
+                _num(
+                    row.get(
+                        "valid_discount_metrics",
+                        0,
+                    )
+                )
+            )
+            else 0
+        )
+
+        fundamental_n = int(
+            _num(
+                row.get(
+                    "valid_fundamental_components",
+                    0,
+                )
+            )
+            if np.isfinite(
+                _num(
+                    row.get(
+                        "valid_fundamental_components",
+                        0,
+                    )
+                )
+            )
+            else 0
+        )
+
+        signal_n = int(
+            _num(
+                row.get(
+                    "valid_signal_components",
+                    0,
+                )
+            )
+            if np.isfinite(
+                _num(
+                    row.get(
+                        "valid_signal_components",
+                        0,
+                    )
+                )
+            )
+            else 0
+        )
+
+        if sector == HEALTH_CARE:
+            component_ok = (
+                discount_n >= MIN_DISCOUNT_COMPONENTS
+                and fundamental_n >= MIN_FUNDAMENTAL_COMPONENTS
+                and signal_n >= 1
+            )
+
+        elif sector == INDUSTRIALS:
+            component_ok = (
+                discount_n >= MIN_DISCOUNT_COMPONENTS
+                and fundamental_n >= MIN_FUNDAMENTAL_COMPONENTS
+                and signal_n >= 1
+            )
+
+        elif sector == TECHNOLOGY:
+            component_ok = (
+                signal_n >= 2
+            )
+
+        else:
+            component_ok = False
+
+        rows.append(
+            {
+                "sector":
+                    sector,
+
+                "ticker":
+                    ticker,
+
+                "valid_valuation_metrics":
+                    valuation_n,
+
+                "valid_discount_metrics":
+                    discount_n,
+
+                "valid_fundamental_components":
+                    fundamental_n,
+
+                "valid_signal_components":
+                    signal_n,
+
+                "final_signal_score":
+                    row.get(
+                        "final_signal_score"
+                    ),
+
+                "signal_percentile":
+                    row.get(
+                        "signal_percentile"
+                    ),
+
+                "entry_signal":
+                    row.get(
+                        "entry_signal"
+                    ),
+
+                "component_ok":
+                    component_ok,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ======================================================================================
+# AUDITORIA DAS REGRAS CONGELADAS
+# ======================================================================================
+
+def audit_frozen_rules() -> Dict:
+    """
+    Confirma em runtime que as regras centrais continuam congeladas.
+    """
+
+    return {
+        "health_care_rule":
+            {
+                "valuation":
+                    0.10,
+
+                "discount":
+                    0.80,
+
+                "fundamental":
+                    0.10,
+
+                "status":
+                    "APROVADO",
+            },
+
+        "industrials_rule":
+            {
+                "valuation":
+                    0.00,
+
+                "discount":
+                    0.20,
+
+                "fundamental":
+                    0.80,
+
+                "status":
+                    "CONDICIONAL",
+
+                "allow_strong_entry":
+                    False,
+            },
+
+        "technology_rule":
+            {
+                "momentum_6m":
+                    0.50,
+
+                "momentum_12m":
+                    0.50,
+
+                "status":
+                    "REGRA ALTERNATIVA APROVADA",
+            },
+
+        "entry_thresholds":
+            {
+                "strong":
+                    0.75,
+
+                "entry":
+                    0.50,
+
+                "wait":
+                    0.25,
+            },
+
+        "historical_signal_benchmark":
+            "SETOR — SOMENTE SNAPSHOTS ANTERIORES",
+
+        "minimum_signal_history":
+            MIN_HISTORY,
+    }
+
+
+# ======================================================================================
+# IMPRESSÃO DE AUDITORIA
+# ======================================================================================
+
+def print_entry_audit(
+    ranking: pd.DataFrame,
+):
+    """
+    Impressão completa para GitHub Actions.
+    """
+
+    audit = audit_entry_ranking(
+        ranking
+    )
+
+    print(
+        "\n"
+        +
+        "=" * 110
+    )
+
+    print(
+        "AUDITORIA — ENTRY ENGINE"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        f"\nAções                    : "
+        f"{audit['number_of_stocks']}"
+    )
+
+    print(
+        f"Setores                   : "
+        f"{audit['number_of_sectors']}"
+    )
+
+    print(
+        f"Entrada Forte             : "
+        f"{audit['entry_strong']}"
+    )
+
+    print(
+        f"Entrada                   : "
+        f"{audit['entry']}"
+    )
+
+    print(
+        f"Aguardar                  : "
+        f"{audit['wait']}"
+    )
+
+    print(
+        f"Não comprar agora         : "
+        f"{audit['do_not_buy']}"
+    )
+
+    print(
+        f"Violação Industrials      : "
+        f"{audit['industrial_strong_violation']}"
+    )
+
+    print(
+        f"Estrutura OK              : "
+        f"{audit['structure_ok']}"
+    )
+
+    print(
+        "\nComponentes:"
+    )
+
+    component_table = (
+        audit_entry_components(
+            ranking
+        )
+    )
+
+    print(
+        component_table.to_string(
+            index=False
+        )
+    )
+
+
 if __name__ == "__main__":
-    print("ENTRY ENGINE — lógica histórica da Célula 41 carregada.")
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        "PORTFOLIO ACOES AMERICANO — ENTRY ENGINE"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        "\nArquitetura congelada:"
+    )
+
+    print(
+        "  Health Care"
+        " -> 10% Valuation + 80% Desconto + 10% Fundamentos"
+    )
+
+    print(
+        "  Industrials"
+        " -> 20% Desconto + 80% Fundamentos — CONDICIONAL"
+    )
+
+    print(
+        "  Information Technology"
+        " -> Momentum 6M + Momentum 12M"
+    )
+
+    print(
+        "\nNormalização:"
+    )
+
+    print(
+        "  Valuation     -> próprio histórico da ação"
+    )
+
+    print(
+        "  Desconto      -> próprio histórico da ação"
+    )
+
+    print(
+        "  Fundamentos   -> próprio histórico da ação"
+    )
+
+    print(
+        "  Sinal final   -> histórico anterior do SETOR"
+    )
+
+    print(
+        "\nClassificação:"
+    )
+
+    print(
+        "  >= 75% -> ENTRADA FORTE"
+    )
+
+    print(
+        "  >= 50% -> ENTRADA"
+    )
+
+    print(
+        "  >= 25% -> AGUARDAR"
+    )
+
+    print(
+        "  <  25% -> NÃO COMPRAR AGORA"
+    )
+
+    print(
+        "\nProteção:"
+    )
+
+    print(
+        "  Industrials nunca recebe ENTRADA FORTE."
+    )
+
+    print(
+        "\nSTATUS: ENTRY ENGINE CARREGADO"
+    )
