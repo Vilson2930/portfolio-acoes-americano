@@ -921,45 +921,126 @@ def _valuation_raw(
     """
     Reproduz os múltiplos da Célula 33B.
 
-    Market Cap:
-        price × shares_outstanding
-
-    Fallback:
-        diluted_shares somente quando shares_outstanding
-        não estiver disponível ou for inválido.
-
-    Regra econômica:
-        0 < múltiplo <= 500
+    Regras:
+        1. Market Cap = preço × shares_outstanding
+        2. diluted_shares apenas como fallback
+        3. Market Cap válido somente quando:
+             MIN_MARKET_CAP <= market_cap <= MAX_MARKET_CAP
+             e shares_ratio entre 0,50 e 2,00
+        4. P/B, P/S, P/OCF e P/FCF são invalidados quando
+           a base de Market Cap é suspeita.
+        5. 0 < múltiplo <= 500
     """
 
-    shares_outstanding = _num(f.get("shares_outstanding"))
-    diluted_shares = _num(f.get("diluted_shares"))
+    MIN_MARKET_CAP = 50_000_000
+    MAX_MARKET_CAP = 20_000_000_000_000
+    MIN_SHARE_RATIO = 0.50
+    MAX_SHARE_RATIO = 2.00
+    MAX_MULTIPLE = 500.0
 
-    if np.isfinite(shares_outstanding) and shares_outstanding > 0:
+    shares_outstanding = _num(
+        f.get("shares_outstanding")
+    )
+
+    diluted_shares = _num(
+        f.get("diluted_shares")
+    )
+
+    if (
+        np.isfinite(shares_outstanding)
+        and shares_outstanding > 0
+    ):
         shares_for_market_cap = shares_outstanding
         shares_source = "shares_outstanding"
-    elif np.isfinite(diluted_shares) and diluted_shares > 0:
+
+    elif (
+        np.isfinite(diluted_shares)
+        and diluted_shares > 0
+    ):
         shares_for_market_cap = diluted_shares
         shares_source = "diluted_shares_fallback"
+
     else:
         shares_for_market_cap = np.nan
         shares_source = "missing"
 
     market_cap = (
         price * shares_for_market_cap
-        if (np.isfinite(price) and np.isfinite(shares_for_market_cap) and shares_for_market_cap > 0)
+        if (
+            np.isfinite(price)
+            and np.isfinite(shares_for_market_cap)
+            and shares_for_market_cap > 0
+        )
         else np.nan
     )
 
-    eps = _num(f.get("diluted_eps"))
-    equity = _num(f.get("equity"))
-    revenue = _num(f.get("revenue"))
-    ocf = _num(f.get("operating_cash_flow"))
-    fcf = _num(f.get("free_cash_flow"))
+    # ------------------------------------------------------------------
+    # SANIDADE ENTRE SHARES OUTSTANDING E DILUTED SHARES
+    # ------------------------------------------------------------------
 
-    def positive_ratio(numerator, denominator):
+    if (
+        np.isfinite(shares_outstanding)
+        and shares_outstanding > 0
+        and np.isfinite(diluted_shares)
+        and diluted_shares > 0
+    ):
+        shares_ratio = (
+            shares_outstanding
+            /
+            diluted_shares
+        )
+    else:
+        shares_ratio = np.nan
+
+    shares_ratio_ok = (
+        (
+            np.isfinite(shares_ratio)
+            and MIN_SHARE_RATIO <= shares_ratio <= MAX_SHARE_RATIO
+        )
+        or
+        not np.isfinite(shares_ratio)
+    )
+
+    market_cap_range_ok = (
+        np.isfinite(market_cap)
+        and MIN_MARKET_CAP <= market_cap <= MAX_MARKET_CAP
+    )
+
+    # Exatamente como na Célula 33B:
+    # market_cap_valid depende também da sanidade do shares_ratio.
+    market_cap_valid = bool(
+        market_cap_range_ok
+        and shares_ratio_ok
+    )
+
+    eps = _num(
+        f.get("diluted_eps")
+    )
+
+    equity = _num(
+        f.get("equity")
+    )
+
+    revenue = _num(
+        f.get("revenue")
+    )
+
+    ocf = _num(
+        f.get("operating_cash_flow")
+    )
+
+    fcf = _num(
+        f.get("free_cash_flow")
+    )
+
+    def positive_ratio(
+        numerator,
+        denominator,
+    ):
+
         numerator = _num(numerator)
         denominator = _num(denominator)
+
         if (
             not np.isfinite(numerator)
             or not np.isfinite(denominator)
@@ -967,16 +1048,54 @@ def _valuation_raw(
             or denominator <= 0
         ):
             return np.nan
+
         value = numerator / denominator
-        if not np.isfinite(value) or value <= 0 or value > 500:
+
+        if (
+            not np.isfinite(value)
+            or value <= 0
+            or value > MAX_MULTIPLE
+        ):
             return np.nan
+
         return float(value)
 
-    pe = positive_ratio(price, eps)
-    pb = positive_ratio(market_cap, equity)
-    ps = positive_ratio(market_cap, revenue)
-    p_ocf = positive_ratio(market_cap, ocf)
-    p_fcf = positive_ratio(market_cap, fcf)
+    # P/E é direto preço / EPS e NÃO depende do market_cap_valid.
+    pe = positive_ratio(
+        price,
+        eps,
+    )
+
+    # Market-cap multiples.
+    pb = positive_ratio(
+        market_cap,
+        equity,
+    )
+
+    ps = positive_ratio(
+        market_cap,
+        revenue,
+    )
+
+    p_ocf = positive_ratio(
+        market_cap,
+        ocf,
+    )
+
+    p_fcf = positive_ratio(
+        market_cap,
+        fcf,
+    )
+
+    # ------------------------------------------------------------------
+    # CÉLULA 33B — INVALIDAR MÚLTIPLOS DE MARKET CAP
+    # ------------------------------------------------------------------
+
+    if not market_cap_valid:
+        pb = np.nan
+        ps = np.nan
+        p_ocf = np.nan
+        p_fcf = np.nan
 
     return {
         "pe": pe,
@@ -984,9 +1103,24 @@ def _valuation_raw(
         "ps": ps,
         "p_ocf": p_ocf,
         "p_fcf": p_fcf,
-        "shares_for_market_cap": shares_for_market_cap,
-        "shares_source": shares_source,
-        "market_cap": market_cap,
+
+        "shares_for_market_cap":
+            shares_for_market_cap,
+
+        "shares_source":
+            shares_source,
+
+        "shares_ratio":
+            shares_ratio,
+
+        "shares_ratio_ok":
+            shares_ratio_ok,
+
+        "market_cap":
+            market_cap,
+
+        "market_cap_valid":
+            market_cap_valid,
     }
 
 # ======================================================================================
