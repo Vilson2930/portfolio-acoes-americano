@@ -18,13 +18,28 @@ jobs:
 
     timeout-minutes: 60
 
+    env:
+      PYTHONUNBUFFERED: "1"
+
+      # Identificação utilizada nas requisições à SEC
+      SEC_USER_AGENT: "Vilson Portfolio Research vilsonjosepereirapinto@gmail.com"
+
+      # Configuração do envio por e-mail
+      SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
     steps:
+
       # ================================================================
       # 1. REPOSITÓRIO
       # ================================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
 
       # ================================================================
       # 2. PYTHON
@@ -36,6 +51,7 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+
       # ================================================================
       # 3. DEPENDÊNCIAS
       # ================================================================
@@ -44,6 +60,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+          # Garante a biblioteca usada para gerar o PDF
+          python -m pip install reportlab
+
 
       # ================================================================
       # 4. DIRETÓRIOS
@@ -55,18 +75,55 @@ jobs:
           mkdir -p data/cache
           mkdir -p output
 
+
       # ================================================================
-      # 5. EXECUTAR MOTOR
+      # 5. VALIDAR CONFIGURAÇÃO
+      # ================================================================
+
+      - name: Validate configuration
+        run: |
+          python -m py_compile config.py
+          python -m py_compile data.py
+          python -m py_compile selection.py
+          python -m py_compile entry.py
+          python -m py_compile report.py
+          python -m py_compile email_report.py
+          python -m py_compile main.py
+
+          if [ -z "$SEC_USER_AGENT" ]; then
+            echo "ERRO: SEC_USER_AGENT está vazio."
+            exit 1
+          fi
+
+          echo "Configuração validada."
+
+
+      # ================================================================
+      # 6. EXECUTAR MOTOR
       # ================================================================
 
       - name: Run portfolio engine
-        env:
-          PYTHONUNBUFFERED: "1"
         run: |
-          python main.py
+          python -u main.py
+
 
       # ================================================================
-      # 6. MOSTRAR ARQUIVOS GERADOS
+      # 7. VALIDAR RESULTADOS
+      # ================================================================
+
+      - name: Validate generated reports
+        run: |
+          test -s output/portfolio_ranking.csv
+          test -s output/portfolio_report.pdf
+
+          echo "Relatórios principais encontrados."
+
+          ls -lh output/portfolio_ranking.csv
+          ls -lh output/portfolio_report.pdf
+
+
+      # ================================================================
+      # 8. MOSTRAR ARQUIVOS GERADOS
       # ================================================================
 
       - name: Show generated files
@@ -78,8 +135,37 @@ jobs:
           echo "===== DATA ====="
           find data -maxdepth 2 -type f -print || true
 
+
       # ================================================================
-      # 7. SALVAR RELATÓRIOS COMO ARTIFACT
+      # 9. ENVIAR RELATÓRIO POR E-MAIL
+      # ================================================================
+
+      - name: Validate email configuration
+        run: |
+          missing=0
+
+          for var in SMTP_SERVER SMTP_PORT SMTP_USER SMTP_PASSWORD EMAIL_TO
+          do
+            if [ -z "${!var}" ]; then
+              echo "ERRO: $var está vazio."
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Configuração de e-mail validada."
+
+
+      - name: Send portfolio report by email
+        run: |
+          python -u email_report.py
+
+
+      # ================================================================
+      # 10. SALVAR RELATÓRIOS COMO ARTIFACT
       # ================================================================
 
       - name: Upload reports
@@ -93,8 +179,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+
       # ================================================================
-      # 8. PERSISTIR CARTEIRA ATUAL
+      # 11. PERSISTIR CARTEIRA ATUAL
       # ================================================================
       #
       # O current_portfolio.csv precisa permanecer no repositório,
