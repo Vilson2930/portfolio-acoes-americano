@@ -1,6 +1,6 @@
 # ======================================================================================
 # PORTFOLIO ACOES AMERICANO
-# entry.py — VERSÃO CORRIGIDA / ALINHADA À CÉLULA 41
+# entry.py — VERSÃO CORRIGIDA / ALINHADA ÀS CÉLULAS 33, 37 E 41
 # ======================================================================================
 #
 # CORREÇÃO CENTRAL
@@ -397,13 +397,11 @@ def _prepare_facts(
         "diluted_shares",
     }
 
+    # Célula 33: somente formulários 10-K / 10-Q e respectivas emendas.
+    # Os fluxos são anuais (10-K); os instantâneos podem usar 10-K ou 10-Q.
     annual_forms = {
         "10-K",
         "10-K/A",
-        "20-F",
-        "20-F/A",
-        "40-F",
-        "40-F/A",
     }
 
     instant_forms = {
@@ -411,10 +409,6 @@ def _prepare_facts(
         "10-K/A",
         "10-Q",
         "10-Q/A",
-        "20-F",
-        "20-F/A",
-        "40-F",
-        "40-F/A",
     }
 
     if "form" in facts.columns:
@@ -482,20 +476,13 @@ def _prepare_facts(
         ]
     ).dt.days
 
-    # Se START existe para um fluxo, precisa ter duração anual.
-    # Mantemos apenas o fallback sem START para não quebrar uma tag SEC
-    # que excepcionalmente não carregue a data inicial.
-    valid_duration = (
-        facts[
-            "duration_days"
-        ].between(
-            250,
-            450,
-        )
-        |
-        facts[
-            "duration_days"
-        ].isna()
+    # Célula 33: fluxo anual só é aceito com duração entre 250 e 450 dias.
+    # Não há fallback para duração ausente.
+    valid_duration = facts[
+        "duration_days"
+    ].between(
+        250,
+        450,
     )
 
     facts = facts[
@@ -687,6 +674,7 @@ def _snapshot_fundamentals(
         "short_term_debt",
         "diluted_eps",
         "diluted_shares",
+        "shares",
     ]:
 
         row = _latest_metric(
@@ -719,10 +707,11 @@ def _snapshot_fundamentals(
     ocf = raw["operating_cash_flow"]
     capex = raw["capex"]
 
+    # Célula 33: FCF = operating_cash_flow - capex.
     fcf = (
         ocf
         -
-        abs(capex)
+        capex
         if (
             np.isfinite(ocf)
             and
@@ -957,7 +946,13 @@ def _apply_cell37_growth_logic(
     return out
 
 def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
-    shares = _num(f.get("diluted_shares"))
+    """Reproduz os múltiplos da Célula 33."""
+
+    # Célula 33: preferência por shares; diluted_shares é apenas fallback.
+    shares = _num(f.get("shares"))
+    if not np.isfinite(shares) or shares <= 0:
+        shares = _num(f.get("diluted_shares"))
+
     market_cap = (
         price * shares
         if np.isfinite(price) and np.isfinite(shares) and shares > 0
@@ -970,14 +965,34 @@ def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
     ocf = _num(f.get("operating_cash_flow"))
     fcf = _num(f.get("free_cash_flow"))
 
-    # múltiplos negativos/não econômicos são tratados como ausentes
-    pe = price / eps if np.isfinite(eps) and eps > 0 else np.nan
-    pb = market_cap / equity if np.isfinite(market_cap) and np.isfinite(equity) and equity > 0 else np.nan
-    ps = market_cap / revenue if np.isfinite(market_cap) and np.isfinite(revenue) and revenue > 0 else np.nan
-    p_ocf = market_cap / ocf if np.isfinite(market_cap) and np.isfinite(ocf) and ocf > 0 else np.nan
-    p_fcf = market_cap / fcf if np.isfinite(market_cap) and np.isfinite(fcf) and fcf > 0 else np.nan
+    def positive_ratio(numerator, denominator):
+        numerator = _num(numerator)
+        denominator = _num(denominator)
+        if (
+            not np.isfinite(numerator)
+            or not np.isfinite(denominator)
+            or numerator <= 0
+            or denominator <= 0
+        ):
+            return np.nan
+        value = numerator / denominator
+        if not np.isfinite(value) or value <= 0 or value > 500:
+            return np.nan
+        return float(value)
 
-    return {"pe": pe, "pb": pb, "ps": ps, "p_ocf": p_ocf, "p_fcf": p_fcf}
+    pe = positive_ratio(price, eps)
+    pb = positive_ratio(market_cap, equity)
+    ps = positive_ratio(market_cap, revenue)
+    p_ocf = positive_ratio(market_cap, ocf)
+    p_fcf = positive_ratio(market_cap, fcf)
+
+    return {
+        "pe": pe,
+        "pb": pb,
+        "ps": ps,
+        "p_ocf": p_ocf,
+        "p_fcf": p_fcf,
+    }
 
 
 # ======================================================================================
@@ -1020,120 +1035,85 @@ def build_entry_signal_history(
         price_hist = daily[daily["ticker"] == ticker].sort_values("date").copy()
         fact_hist = facts[facts["ticker"] == ticker].copy()
 
-        if price_hist.empty:
-            continue
-
         for snapshot in snapshot_dates:
-            price_rows = price_hist[price_hist["date"] <= snapshot]
-            if price_rows.empty:
-                continue
+            # A Célula 33 SEMPRE cria a linha ticker x snapshot.
+            # Preço é associado depois, para trás, com tolerância de 10 dias.
+            pr = None
 
-            pr = price_rows.iloc[-1]
-            # tolerância de 10 dias como no estudo
-            if (snapshot - pd.Timestamp(pr["date"])).days > 10:
-                continue
+            if not price_hist.empty:
+                price_rows = price_hist[price_hist["date"] <= snapshot]
+
+                if not price_rows.empty:
+                    candidate = price_rows.iloc[-1]
+                    age_days = (
+                        snapshot
+                        -
+                        pd.Timestamp(candidate["date"])
+                    ).days
+
+                    if age_days <= 10:
+                        pr = candidate
+
+            market_price = (
+                _num(pr["price"])
+                if pr is not None
+                else np.nan
+            )
 
             f = _snapshot_fundamentals(fact_hist, snapshot)
-            valuation = _valuation_raw(_num(pr["price"]), f)
+            valuation = _valuation_raw(market_price, f)
+
+            price_components = {
+                k: (
+                    _num(pr[k])
+                    if pr is not None
+                    else np.nan
+                )
+                for k in DISCOUNT_METRICS
+            }
 
             rows.append(
                 {
-                    "snapshot_date":
-                        snapshot,
-
-                    "sector":
-                        sector_map[ticker],
-
-                    "ticker":
-                        ticker,
-
-                    "market_price":
-                        _num(pr["price"]),
-
+                    "snapshot_date": snapshot,
+                    "sector": sector_map[ticker],
+                    "ticker": ticker,
+                    "market_price": market_price,
                     **valuation,
 
                     # Base fundamental da Célula 37
-                    "revenue":
-                        f.get("revenue", np.nan),
+                    "revenue": f.get("revenue", np.nan),
+                    "net_income": f.get("net_income", np.nan),
+                    "operating_cash_flow": f.get("operating_cash_flow", np.nan),
+                    "free_cash_flow": f.get("free_cash_flow", np.nan),
+                    "diluted_eps": f.get("diluted_eps", np.nan),
+                    "shares": f.get("shares", np.nan),
+                    "diluted_shares": f.get("diluted_shares", np.nan),
 
-                    "net_income":
-                        f.get("net_income", np.nan),
+                    "revenue_period_end": f.get("revenue_period_end", pd.NaT),
+                    "net_income_period_end": f.get("net_income_period_end", pd.NaT),
+                    "operating_cash_flow_period_end": f.get(
+                        "operating_cash_flow_period_end", pd.NaT
+                    ),
+                    "diluted_eps_period_end": f.get(
+                        "diluted_eps_period_end", pd.NaT
+                    ),
 
-                    "operating_cash_flow":
-                        f.get(
-                            "operating_cash_flow",
-                            np.nan,
-                        ),
+                    "net_margin": f.get("net_margin", np.nan),
+                    "ocf_margin": f.get("ocf_margin", np.nan),
+                    "fcf_margin": f.get("fcf_margin", np.nan),
 
-                    "free_cash_flow":
-                        f.get(
-                            "free_cash_flow",
-                            np.nan,
-                        ),
+                    **price_components,
 
-                    "diluted_eps":
-                        f.get(
-                            "diluted_eps",
-                            np.nan,
-                        ),
-
-                    "revenue_period_end":
-                        f.get(
-                            "revenue_period_end",
-                            pd.NaT,
-                        ),
-
-                    "net_income_period_end":
-                        f.get(
-                            "net_income_period_end",
-                            pd.NaT,
-                        ),
-
-                    "operating_cash_flow_period_end":
-                        f.get(
-                            "operating_cash_flow_period_end",
-                            pd.NaT,
-                        ),
-
-                    "diluted_eps_period_end":
-                        f.get(
-                            "diluted_eps_period_end",
-                            pd.NaT,
-                        ),
-
-                    "net_margin":
-                        f.get(
-                            "net_margin",
-                            np.nan,
-                        ),
-
-                    "ocf_margin":
-                        f.get(
-                            "ocf_margin",
-                            np.nan,
-                        ),
-
-                    "fcf_margin":
-                        f.get(
-                            "fcf_margin",
-                            np.nan,
-                        ),
-
-                    **{
-                        k:
-                            _num(pr[k])
-                        for k in DISCOUNT_METRICS
-                    },
-
-                    "momentum_6m":
-                        _num(
-                            pr["momentum_6m"]
-                        ),
-
-                    "momentum_12m":
-                        _num(
-                            pr["momentum_12m"]
-                        ),
+                    "momentum_6m": (
+                        _num(pr["momentum_6m"])
+                        if pr is not None
+                        else np.nan
+                    ),
+                    "momentum_12m": (
+                        _num(pr["momentum_12m"])
+                        if pr is not None
+                        else np.nan
+                    ),
                 }
             )
 
