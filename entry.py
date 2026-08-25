@@ -1,6 +1,6 @@
 # ======================================================================================
 # PORTFOLIO ACOES AMERICANO
-# entry.py — VERSÃO CORRIGIDA / ALINHADA ÀS CÉLULAS 33, 37 E 41
+# entry.py — VERSÃO CORRIGIDA / ALINHADA ÀS CÉLULAS 33B, 37 E 41
 # ======================================================================================
 #
 # CORREÇÃO CENTRAL
@@ -397,11 +397,16 @@ def _prepare_facts(
         "diluted_shares",
     }
 
-    # Célula 33: somente formulários 10-K / 10-Q e respectivas emendas.
-    # Os fluxos são anuais (10-K); os instantâneos podem usar 10-K ou 10-Q.
+    # Célula 33B:
+    # fluxos usam formulários anuais;
+    # estoques/instantâneos também podem usar trimestrais.
     annual_forms = {
         "10-K",
         "10-K/A",
+        "20-F",
+        "20-F/A",
+        "40-F",
+        "40-F/A",
     }
 
     instant_forms = {
@@ -409,6 +414,10 @@ def _prepare_facts(
         "10-K/A",
         "10-Q",
         "10-Q/A",
+        "20-F",
+        "20-F/A",
+        "40-F",
+        "40-F/A",
     }
 
     if "form" in facts.columns:
@@ -476,7 +485,7 @@ def _prepare_facts(
         ]
     ).dt.days
 
-    # Célula 33: fluxo anual só é aceito com duração entre 250 e 450 dias.
+    # Célula 33B: fluxo anual só é aceito com duração entre 250 e 450 dias.
     # Não há fallback para duração ausente.
     valid_duration = facts[
         "duration_days"
@@ -642,26 +651,24 @@ def _snapshot_fundamentals(
     """
     Snapshot point-in-time dos fatos SEC.
 
-    FIDELIDADE AO ESTUDO:
-    --------------------
-    A Célula 37 não calculava os crescimentos usando uma busca
-    aproximada de 300–430 dias. Ela carregava, para cada snapshot,
-    o valor conhecido e o respectivo period_end e depois calculava
-    crescimento entre PERÍODOS FUNDAMENTAIS ÚNICOS consecutivos.
+    CÉLULA 33B
+    ----------
+    A base fundamental é reconstruída com:
+        available_date <= snapshot
+        end <= snapshot
 
-    Por isso esta função devolve:
-      • valor;
-      • period_end;
-      • free_cash_flow.
+    Para Market Cap:
+        1. shares_outstanding
+        2. diluted_shares como fallback
 
-    Os growth_yoy são construídos depois, sobre a série mensal,
-    exatamente como na Célula 37.
+    A função também mantém os period_end usados depois pela lógica
+    de crescimento da Célula 37.
     """
 
     raw = {}
     period_end = {}
 
-    for metric in [
+    metrics = [
         "revenue",
         "net_income",
         "operating_income",
@@ -674,91 +681,53 @@ def _snapshot_fundamentals(
         "short_term_debt",
         "diluted_eps",
         "diluted_shares",
+        "shares_outstanding",
         "shares",
-    ]:
+    ]
 
-        row = _latest_metric(
-            ticker_history,
-            metric,
-            snapshot,
-        )
+    for metric in metrics:
+        row = _latest_metric(ticker_history, metric, snapshot)
 
         if row is None:
-
             raw[metric] = np.nan
             period_end[metric] = pd.NaT
-
         else:
-
-            raw[metric] = _num(
-                row["value"]
-            )
-
+            raw[metric] = _num(row["value"])
             period_end[metric] = pd.to_datetime(
-                row.get(
-                    "end",
-                    pd.NaT,
-                ),
-                errors="coerce",
+                row.get("end", pd.NaT), errors="coerce"
             )
+
+    shares_outstanding = _num(raw.get("shares_outstanding"))
+    legacy_shares = _num(raw.get("shares"))
+
+    if (not np.isfinite(shares_outstanding) or shares_outstanding <= 0):
+        if np.isfinite(legacy_shares) and legacy_shares > 0:
+            shares_outstanding = legacy_shares
+
+    raw["shares_outstanding"] = shares_outstanding
 
     revenue = raw["revenue"]
     net_income = raw["net_income"]
     ocf = raw["operating_cash_flow"]
     capex = raw["capex"]
 
-    # Célula 33: FCF = operating_cash_flow - capex.
     fcf = (
-        ocf
-        -
-        capex
-        if (
-            np.isfinite(ocf)
-            and
-            np.isfinite(capex)
-        )
-        else
-        np.nan
+        ocf - capex
+        if (np.isfinite(ocf) and np.isfinite(capex))
+        else np.nan
     )
 
     return {
         **raw,
-
-        "revenue_period_end":
-            period_end["revenue"],
-
-        "net_income_period_end":
-            period_end["net_income"],
-
-        "operating_cash_flow_period_end":
-            period_end["operating_cash_flow"],
-
-        "diluted_eps_period_end":
-            period_end["diluted_eps"],
-
-        "free_cash_flow":
-            fcf,
-
-        # Margens são iguais às da Célula 37.
-        "net_margin":
-            _safe_div(
-                net_income,
-                revenue,
-            ),
-
-        "ocf_margin":
-            _safe_div(
-                ocf,
-                revenue,
-            ),
-
-        "fcf_margin":
-            _safe_div(
-                fcf,
-                revenue,
-            ),
+        "revenue_period_end": period_end["revenue"],
+        "net_income_period_end": period_end["net_income"],
+        "operating_cash_flow_period_end": period_end["operating_cash_flow"],
+        "diluted_eps_period_end": period_end["diluted_eps"],
+        "free_cash_flow": fcf,
+        "net_margin": _safe_div(net_income, revenue),
+        "ocf_margin": _safe_div(ocf, revenue),
+        "fcf_margin": _safe_div(fcf, revenue),
     }
-
 
 def _apply_cell37_growth_logic(
     hist: pd.DataFrame,
@@ -945,17 +914,40 @@ def _apply_cell37_growth_logic(
 
     return out
 
-def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
-    """Reproduz os múltiplos da Célula 33."""
+def _valuation_raw(
+    price: float,
+    f: Dict[str, float],
+) -> Dict[str, float]:
+    """
+    Reproduz os múltiplos da Célula 33B.
 
-    # Célula 33: preferência por shares; diluted_shares é apenas fallback.
-    shares = _num(f.get("shares"))
-    if not np.isfinite(shares) or shares <= 0:
-        shares = _num(f.get("diluted_shares"))
+    Market Cap:
+        price × shares_outstanding
+
+    Fallback:
+        diluted_shares somente quando shares_outstanding
+        não estiver disponível ou for inválido.
+
+    Regra econômica:
+        0 < múltiplo <= 500
+    """
+
+    shares_outstanding = _num(f.get("shares_outstanding"))
+    diluted_shares = _num(f.get("diluted_shares"))
+
+    if np.isfinite(shares_outstanding) and shares_outstanding > 0:
+        shares_for_market_cap = shares_outstanding
+        shares_source = "shares_outstanding"
+    elif np.isfinite(diluted_shares) and diluted_shares > 0:
+        shares_for_market_cap = diluted_shares
+        shares_source = "diluted_shares_fallback"
+    else:
+        shares_for_market_cap = np.nan
+        shares_source = "missing"
 
     market_cap = (
-        price * shares
-        if np.isfinite(price) and np.isfinite(shares) and shares > 0
+        price * shares_for_market_cap
+        if (np.isfinite(price) and np.isfinite(shares_for_market_cap) and shares_for_market_cap > 0)
         else np.nan
     )
 
@@ -992,8 +984,10 @@ def _valuation_raw(price: float, f: Dict[str, float]) -> Dict[str, float]:
         "ps": ps,
         "p_ocf": p_ocf,
         "p_fcf": p_fcf,
+        "shares_for_market_cap": shares_for_market_cap,
+        "shares_source": shares_source,
+        "market_cap": market_cap,
     }
-
 
 # ======================================================================================
 # CONSTRUIR HISTÓRICO MENSAL DO ENTRY SCORE
@@ -1036,7 +1030,7 @@ def build_entry_signal_history(
         fact_hist = facts[facts["ticker"] == ticker].copy()
 
         for snapshot in snapshot_dates:
-            # A Célula 33 SEMPRE cria a linha ticker x snapshot.
+            # A Célula 33B SEMPRE cria a linha ticker x snapshot.
             # Preço é associado depois, para trás, com tolerância de 10 dias.
             pr = None
 
@@ -1086,6 +1080,7 @@ def build_entry_signal_history(
                     "operating_cash_flow": f.get("operating_cash_flow", np.nan),
                     "free_cash_flow": f.get("free_cash_flow", np.nan),
                     "diluted_eps": f.get("diluted_eps", np.nan),
+                    "shares_outstanding": f.get("shares_outstanding", np.nan),
                     "shares": f.get("shares", np.nan),
                     "diluted_shares": f.get("diluted_shares", np.nan),
 
