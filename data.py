@@ -15,6 +15,7 @@
 #   6. Snapshot fundamental point-in-time
 #   7. Crescimentos YoY necessários ao selection.py
 #   8. Cache local
+#   9. Shares outstanding real da Célula 33B (DEI -> US-GAAP)
 #
 # IMPORTANTE
 # ----------
@@ -985,67 +986,82 @@ def get_company_facts(
 SEC_CONCEPTS = {
 
     "revenue": [
-        ("RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
-        ("Revenues", "USD"),
-        ("SalesRevenueNet", "USD"),
+        ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
+        ("us-gaap", "Revenues", "USD"),
+        ("us-gaap", "SalesRevenueNet", "USD"),
     ],
 
     "net_income": [
-        ("NetIncomeLoss", "USD"),
-        ("ProfitLoss", "USD"),
+        ("us-gaap", "NetIncomeLoss", "USD"),
+        ("us-gaap", "ProfitLoss", "USD"),
     ],
 
     "operating_income": [
-        ("OperatingIncomeLoss", "USD"),
+        ("us-gaap", "OperatingIncomeLoss", "USD"),
     ],
 
     "operating_cash_flow": [
-        ("NetCashProvidedByUsedInOperatingActivities", "USD"),
+        ("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "USD"),
     ],
 
     "capex": [
-        ("PaymentsToAcquirePropertyPlantAndEquipment", "USD"),
-        ("PaymentsToAcquireProductiveAssets", "USD"),
+        ("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment", "USD"),
+        ("us-gaap", "PaymentsToAcquireProductiveAssets", "USD"),
     ],
 
     "assets": [
-        ("Assets", "USD"),
+        ("us-gaap", "Assets", "USD"),
     ],
 
     "equity": [
-        ("StockholdersEquity", "USD"),
+        ("us-gaap", "StockholdersEquity", "USD"),
         (
+            "us-gaap",
             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
             "USD",
         ),
     ],
 
     "cash": [
-        ("CashAndCashEquivalentsAtCarryingValue", "USD"),
+        ("us-gaap", "CashAndCashEquivalentsAtCarryingValue", "USD"),
         (
+            "us-gaap",
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
             "USD",
         ),
     ],
 
     "long_term_debt": [
-        ("LongTermDebtNoncurrent", "USD"),
-        ("LongTermDebt", "USD"),
+        ("us-gaap", "LongTermDebtNoncurrent", "USD"),
+        ("us-gaap", "LongTermDebt", "USD"),
     ],
 
     "short_term_debt": [
-        ("ShortTermBorrowings", "USD"),
-        ("ShortTermDebtCurrent", "USD"),
-        ("LongTermDebtCurrent", "USD"),
-        ("CurrentPortionOfLongTermDebt", "USD"),
+        ("us-gaap", "ShortTermBorrowings", "USD"),
+        ("us-gaap", "ShortTermDebtCurrent", "USD"),
+        ("us-gaap", "LongTermDebtCurrent", "USD"),
+        ("us-gaap", "CurrentPortionOfLongTermDebt", "USD"),
     ],
 
     "diluted_eps": [
-        ("EarningsPerShareDiluted", "USD/shares"),
+        ("us-gaap", "EarningsPerShareDiluted", "USD/shares"),
     ],
 
     "diluted_shares": [
-        ("WeightedAverageNumberOfDilutedSharesOutstanding", "shares"),
+        (
+            "us-gaap",
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+            "shares",
+        ),
+    ],
+
+    # CÉLULA 33B — SHARES OUTSTANDING
+    # Prioridade:
+    # 1) dei:EntityCommonStockSharesOutstanding
+    # 2) us-gaap:CommonStockSharesOutstanding
+    "shares_outstanding": [
+        ("dei", "EntityCommonStockSharesOutstanding", "shares"),
+        ("us-gaap", "CommonStockSharesOutstanding", "shares"),
     ],
 }
 
@@ -1061,23 +1077,38 @@ def extract_concept_observations(
     metric_name: str,
 ) -> pd.DataFrame:
 
-    us_gaap = (
-        company_facts
-        .get("facts", {})
-        .get("us-gaap", {})
-    )
+    """
+    Extrai observações SEC com taxonomia explícita.
+
+    Célula 33B:
+        (taxonomy, tag, unit)
+
+    Isso permite usar a taxonomia DEI para shares_outstanding.
+    available_date = filed.
+    """
 
     rows = []
 
     for priority, spec in enumerate(concept_names):
 
-        if isinstance(spec, (tuple, list)) and len(spec) == 2:
+        if isinstance(spec, (tuple, list)) and len(spec) == 3:
+            taxonomy, tag, expected_unit = spec
+
+        elif isinstance(spec, (tuple, list)) and len(spec) == 2:
+            taxonomy = "us-gaap"
             tag, expected_unit = spec
+
         else:
+            taxonomy = "us-gaap"
             tag = str(spec)
             expected_unit = None
 
-        tag_data = us_gaap.get(tag)
+        tag_data = (
+            company_facts
+            .get("facts", {})
+            .get(taxonomy, {})
+            .get(tag)
+        )
 
         if tag_data is None:
             continue
@@ -1111,7 +1142,7 @@ def extract_concept_observations(
                         "concept": tag,
                         "tag": tag,
                         "priority": int(priority),
-                        "taxonomy": "us-gaap",
+                        "taxonomy": taxonomy,
                         "unit": unit_name,
                         "value": value,
                         "start": start,
@@ -1139,6 +1170,9 @@ def extract_concept_observations(
 
     df = df[df["form"].isin(valid_forms)].copy()
 
+    if df.empty:
+        return pd.DataFrame()
+
     df = (
         df
         .sort_values(
@@ -1149,6 +1183,7 @@ def extract_concept_observations(
             subset=[
                 "ticker",
                 "metric",
+                "taxonomy",
                 "tag",
                 "end",
                 "filed",
@@ -1580,11 +1615,21 @@ def latest_fundamental_snapshot(
     # ------------------------------------------------------------------
 
     known = df[
-        df[
-            "available_date"
-        ]
-        <=
-        as_of_date
+        (
+            df[
+                "available_date"
+            ]
+            <=
+            as_of_date
+        )
+        &
+        (
+            df[
+                "end"
+            ]
+            <=
+            as_of_date
+        )
     ].copy()
 
     if known.empty:
@@ -1714,6 +1759,8 @@ def latest_fundamental_snapshot(
         "long_term_debt",
         "short_term_debt",
         "diluted_eps",
+        "diluted_shares",
+        "shares_outstanding",
     ]
 
     for column in required_numeric:
@@ -1732,6 +1779,37 @@ def latest_fundamental_snapshot(
             ],
             errors="coerce",
         )
+
+    # ------------------------------------------------------------------
+    # CÉLULA 33B — SHARES PARA MARKET CAP
+    # ------------------------------------------------------------------
+
+    wide["shares_for_market_cap"] = (
+        wide["shares_outstanding"]
+        .where(
+            wide["shares_outstanding"] > 0,
+            wide["diluted_shares"],
+        )
+    )
+
+    wide["shares_source"] = np.where(
+        (
+            wide["shares_outstanding"].notna()
+            &
+            (wide["shares_outstanding"] > 0)
+        ),
+        "shares_outstanding",
+        "diluted_shares",
+    )
+
+    wide["shares_ratio"] = (
+        wide["shares_outstanding"]
+        /
+        wide["diluted_shares"].replace(0, np.nan)
+    )
+
+    # Compatibilidade com partes antigas do projeto.
+    wide["shares"] = wide["shares_outstanding"]
 
     # Dívida total
 
