@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Tuple
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -59,7 +60,6 @@ from config import (
     SECTORS,
     SECTOR_TARGETS,
     SELECTION_FACTORS as CONFIG_SELECTION_FACTORS,
-    FRONTIER_MIN_RELATIVE_GAP,
     CURRENT_PORTFOLIO_FILE,
 )
 
@@ -893,286 +893,1010 @@ def load_previous_portfolio() -> pd.DataFrame:
 
 
 # ======================================================================================
-# 8. REGRA DE FRONTEIRA 5º VS 6º
+# 8. FRONTEIRA FINAL — CÉLULA 31
+# ======================================================================================
+#
+# A Célula 31 NÃO usa uma simples regra de persistência da carteira anterior.
+#
+# Regra fiel:
+#   • Top 1–4 de cada setor permanecem.
+#   • Só 5º x 6º podem ser comparados.
+#   • O 6º só pode substituir o 5º se houver "near tie":
+#         gap absoluto <= 0.01 OU gap relativo <= 1%.
+#   • Mesmo com near tie, a troca exige >= 3 melhorias de risco.
+#   • A troca é bloqueada se houver deterioração relevante.
+#
+# IMPORTANTE:
+# Os fatores usados aqui continuam sendo os vencedores já validados:
+#   Health Care              -> Financial Strength
+#   Industrials              -> Growth
+#   Information Technology   -> Financial Strength
+#
 # ======================================================================================
 
-def apply_frontier_rule(
-    ranked: pd.DataFrame,
-    score_column: str,
-    sector: str,
-    previous_portfolio: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
+MAX_ABSOLUTE_FACTOR_GAP = 0.01
+MAX_RELATIVE_FACTOR_GAP = 0.01
 
-    target = SECTOR_TARGETS[
-        sector
-    ]
+MIN_RISK_IMPROVEMENTS = 3
 
-    ranked = (
-        ranked
-        .sort_values(
-            score_column,
-            ascending=False,
-        )
-        .reset_index(drop=True)
-        .copy()
-    )
+VOL_IMPROVEMENT = 0.0025
+SHARPE_IMPROVEMENT = 0.02
+DRAWDOWN_IMPROVEMENT = 0.005
+CORRELATION_IMPROVEMENT = 0.01
+RISK_CONTRIBUTION_IMPROVEMENT = 0.01
 
-    if len(ranked) <= target:
+MAX_VOL_DETERIORATION = 0.005
+MAX_SHARPE_DETERIORATION = 0.02
+MAX_DRAWDOWN_DETERIORATION = 0.01
 
-        return ranked.head(
-            target
-        )
-
-    preliminary = (
-        ranked
-        .head(target)
-        .copy()
-    )
-
-    if (
-        previous_portfolio is None
-        or
-        previous_portfolio.empty
-    ):
-
-        return preliminary
-
-    previous_sector = (
-        previous_portfolio[
-            previous_portfolio[
-                "sector"
-            ]
-            ==
-            sector
-        ]
-    )
-
-    previous_tickers = set(
-        previous_sector[
-            "ticker"
-        ]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    if not previous_tickers:
-
-        return preliminary
-
-    rank5 = ranked.iloc[
-        target - 1
-    ]
-
-    rank6 = ranked.iloc[
-        target
-    ]
-
-    ticker5 = str(
-        rank5["ticker"]
-    )
-
-    ticker6 = str(
-        rank6["ticker"]
-    )
-
-    score5 = float(
-        rank5[
-            score_column
-        ]
-    )
-
-    score6 = float(
-        rank6[
-            score_column
-        ]
-    )
-
-    # ------------------------------------------------------------------
-    # Proteção de fronteira:
-    #
-    # 5º = novo candidato
-    # 6º = incumbente da carteira anterior
-    # ------------------------------------------------------------------
-
-    if (
-        ticker5
-        not in previous_tickers
-        and
-        ticker6
-        in previous_tickers
-    ):
-
-        denominator = max(
-            abs(score6),
-            1e-9,
-        )
-
-        relative_gap = (
-            score5
-            -
-            score6
-        ) / denominator
-
-        if (
-            relative_gap
-            <
-            FRONTIER_MIN_RELATIVE_GAP
-        ):
-
-            preliminary = (
-                ranked
-                .head(
-                    target - 1
-                )
-                .copy()
-            )
-
-            incumbent = (
-                ranked[
-                    ranked[
-                        "ticker"
-                    ]
-                    ==
-                    ticker6
-                ]
-                .head(1)
-            )
-
-            preliminary = pd.concat(
-                [
-                    preliminary,
-                    incumbent,
-                ],
-                ignore_index=True,
-            )
-
-    return preliminary
+MIN_COMMON_DAYS = 120
+BOUNDARY_RISK_START = pd.Timestamp("2024-01-01")
+ANNUALIZATION_DAILY = 252
 
 
-# ======================================================================================
-# 9. SELECIONAR TOP 5 DO SETOR
-# ======================================================================================
-
-def select_sector(
+def _rank_all_sectors(
     universe: pd.DataFrame,
-    sector: str,
-    previous_portfolio: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
+    """
+    Ranking fundamental completo dos três setores.
+    Não aplica nenhuma regra de fronteira.
+    """
 
-    sector_df = (
-        universe[
-            universe[
-                "sector"
+    base = build_derived_metrics(universe)
+
+    parts = []
+
+    for sector in SECTORS:
+
+        sector_df = (
+            base[
+                base["sector"] == sector
             ]
-            ==
-            sector
-        ]
-        .copy()
-    )
-
-    if sector_df.empty:
-
-        raise RuntimeError(
-            f"Nenhuma empresa disponível em {sector}"
+            .copy()
         )
 
-    scored, score_column = (
-        score_sector(
+        scored, score_column = score_sector(
             sector_df,
             sector,
         )
-    )
 
-    scored = (
-        scored[
+        scored = (
             scored[
-                score_column
+                scored[score_column].notna()
             ]
-            .notna()
-        ]
-        .copy()
+            .sort_values(
+                [score_column, "ticker"],
+                ascending=[False, True],
+            )
+            .reset_index(drop=True)
+        )
+
+        target = int(
+            SECTOR_TARGETS[sector]
+        )
+
+        if len(scored) < target + 1:
+            raise RuntimeError(
+                f"{sector}: são necessárias pelo menos "
+                f"{target + 1} empresas elegíveis para auditar 5º vs 6º."
+            )
+
+        scored["sector_rank"] = np.arange(
+            1,
+            len(scored) + 1,
+        )
+
+        scored["selection_factor"] = (
+            SELECTION_FACTORS[sector]
+        )
+
+        scored["selection_score"] = (
+            scored[score_column]
+        )
+
+        parts.append(scored)
+
+    return pd.concat(
+        parts,
+        ignore_index=True,
     )
 
-    target = SECTOR_TARGETS[
-        sector
+
+def _build_raw_top5(
+    ranking: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Carteira fundamental pura antes do teste de risco da Célula 31.
+    """
+
+    parts = []
+
+    for sector in SECTORS:
+
+        target = int(
+            SECTOR_TARGETS[sector]
+        )
+
+        part = (
+            ranking[
+                ranking["sector"] == sector
+            ]
+            .sort_values("sector_rank")
+            .head(target)
+            .copy()
+        )
+
+        parts.append(part)
+
+    portfolio = pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+    portfolio["selection_rank"] = (
+        portfolio["sector_rank"]
+        .astype(int)
+    )
+
+    portfolio["selected"] = True
+
+    return portfolio
+
+
+def _normalize_prices(
+    prices: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+
+    close = prices.copy()
+
+    close.index = pd.to_datetime(
+        close.index
+    )
+
+    close.columns = [
+        str(c)
+        .strip()
+        .upper()
+        .replace(".", "-")
+        for c in close.columns
     ]
 
-    if len(scored) < target:
+    close = close.loc[
+        close.index >= BOUNDARY_RISK_START
+    ]
 
-        raise RuntimeError(
-            f"{sector}: apenas {len(scored)} "
-            f"empresas elegíveis para "
-            f"{target} posições."
+    return close.sort_index()
+
+
+def _portfolio_risk_metrics(
+    ticker_list,
+    daily_returns: pd.DataFrame,
+):
+
+    missing = [
+        ticker
+        for ticker in ticker_list
+        if ticker not in daily_returns.columns
+    ]
+
+    if missing:
+        return None
+
+    common = (
+        daily_returns[
+            ticker_list
+        ]
+        .dropna()
+    )
+
+    if len(common) < MIN_COMMON_DAYS:
+        return None
+
+    n = len(ticker_list)
+
+    weights = np.repeat(
+        1 / n,
+        n,
+    )
+
+    portfolio_return = (
+        common
+        .mul(
+            weights,
+            axis=1,
+        )
+        .sum(axis=1)
+    )
+
+    daily_std = portfolio_return.std(
+        ddof=1
+    )
+
+    portfolio_vol = (
+        daily_std
+        *
+        np.sqrt(
+            ANNUALIZATION_DAILY
+        )
+    )
+
+    sharpe = (
+        portfolio_return.mean()
+        /
+        daily_std
+        *
+        np.sqrt(
+            ANNUALIZATION_DAILY
+        )
+        if daily_std > 0
+        else np.nan
+    )
+
+    wealth = (
+        1
+        +
+        portfolio_return
+    ).cumprod()
+
+    drawdown = (
+        wealth
+        /
+        wealth.cummax()
+        -
+        1
+    )
+
+    max_drawdown = drawdown.min()
+
+    corr = common.corr()
+
+    corr_values = []
+
+    for a, b in combinations(
+        ticker_list,
+        2,
+    ):
+
+        value = corr.loc[
+            a,
+            b,
+        ]
+
+        if pd.notna(value):
+            corr_values.append(value)
+
+    mean_correlation = (
+        np.mean(corr_values)
+        if corr_values
+        else np.nan
+    )
+
+    covariance = (
+        common.cov().values
+        *
+        ANNUALIZATION_DAILY
+    )
+
+    variance = (
+        weights
+        @
+        covariance
+        @
+        weights
+    )
+
+    if (
+        not np.isfinite(variance)
+        or
+        variance <= 0
+    ):
+        return None
+
+    vol = np.sqrt(variance)
+
+    marginal = (
+        covariance
+        @
+        weights
+        /
+        vol
+    )
+
+    component = (
+        weights
+        *
+        marginal
+    )
+
+    risk_contribution = (
+        component
+        /
+        vol
+    )
+
+    max_risk_contribution = np.max(
+        risk_contribution
+    )
+
+    return {
+        "observations":
+            len(common),
+
+        "start_date":
+            common.index.min(),
+
+        "end_date":
+            common.index.max(),
+
+        "volatility":
+            portfolio_vol,
+
+        "sharpe":
+            sharpe,
+
+        "max_drawdown":
+            max_drawdown,
+
+        "mean_correlation":
+            mean_correlation,
+
+        "max_risk_contribution":
+            max_risk_contribution,
+    }
+
+
+def _boundary_rows(
+    ranking: pd.DataFrame,
+) -> pd.DataFrame:
+
+    rows = []
+
+    for sector in SECTORS:
+
+        sector_ranking = (
+            ranking[
+                ranking["sector"] == sector
+            ]
+            .sort_values("sector_rank")
         )
 
-    scored = (
-        scored
-        .sort_values(
-            score_column,
-            ascending=False,
+        rank5 = (
+            sector_ranking[
+                sector_ranking["sector_rank"] == 5
+            ]
+            .iloc[0]
         )
-        .reset_index(drop=True)
+
+        rank6 = (
+            sector_ranking[
+                sector_ranking["sector_rank"] == 6
+            ]
+            .iloc[0]
+        )
+
+        score5 = float(
+            rank5["selection_score"]
+        )
+
+        score6 = float(
+            rank6["selection_score"]
+        )
+
+        absolute_gap = (
+            score5
+            -
+            score6
+        )
+
+        relative_gap = (
+            absolute_gap
+            /
+            abs(score5)
+            if score5 != 0
+            else np.nan
+        )
+
+        near_tie = bool(
+            (
+                absolute_gap
+                <=
+                MAX_ABSOLUTE_FACTOR_GAP
+            )
+            or
+            (
+                pd.notna(relative_gap)
+                and
+                relative_gap
+                <=
+                MAX_RELATIVE_FACTOR_GAP
+            )
+        )
+
+        rows.append(
+            {
+                "sector":
+                    sector,
+
+                "factor":
+                    SELECTION_FACTORS[
+                        sector
+                    ],
+
+                "rank5_ticker":
+                    rank5["ticker"],
+
+                "rank5_score":
+                    score5,
+
+                "rank6_ticker":
+                    rank6["ticker"],
+
+                "rank6_score":
+                    score6,
+
+                "absolute_gap":
+                    absolute_gap,
+
+                "relative_gap":
+                    relative_gap,
+
+                "near_tie":
+                    near_tie,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def get_boundary_test_tickers(
+    universe: pd.DataFrame,
+) -> list[str]:
+    """
+    Retorna os 15 Top-5 + os três candidatos de 6º lugar.
+    Útil para o main.py baixar preços ANTES de fechar a carteira.
+    """
+
+    ranking = _rank_all_sectors(
+        universe
     )
 
-    scored[
-        "raw_rank"
-    ] = np.arange(
-        1,
-        len(scored) + 1,
+    raw_portfolio = _build_raw_top5(
+        ranking
     )
 
-    selected = apply_frontier_rule(
-        ranked=scored,
-        score_column=score_column,
-        sector=sector,
-        previous_portfolio=previous_portfolio,
+    boundary = _boundary_rows(
+        ranking
     )
 
-    selected = (
-        selected
+    return sorted(
+        set(
+            raw_portfolio[
+                "ticker"
+            ]
+            .tolist()
+            +
+            boundary[
+                "rank6_ticker"
+            ]
+            .tolist()
+        )
+    )
+
+
+def _run_boundary_test(
+    ranking: pd.DataFrame,
+    raw_portfolio: pd.DataFrame,
+    prices: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Reproduz a lógica decisória da Célula 31.
+    Cada candidato 6º é comparado contra a MESMA carteira Top-5 original.
+    """
+
+    boundary = _boundary_rows(
+        ranking
+    )
+
+    close = _normalize_prices(
+        prices
+    )
+
+    if close.empty:
+
+        boundary["test_valid"] = False
+        boundary["decision"] = (
+            "KEEP — PREÇOS AUSENTES"
+        )
+
+        return boundary
+
+    returns = (
+        close
+        .pct_change(
+            fill_method=None
+        )
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+    )
+
+    current_tickers = (
+        raw_portfolio[
+            "ticker"
+        ]
+        .tolist()
+    )
+
+    rows = []
+
+    for row in boundary.itertuples(
+        index=False
+    ):
+
+        incumbent = row.rank5_ticker
+        challenger = row.rank6_ticker
+
+        comparison_tickers = sorted(
+            set(
+                current_tickers
+                +
+                [challenger]
+            )
+        )
+
+        missing = [
+            ticker
+            for ticker in comparison_tickers
+            if ticker not in returns.columns
+        ]
+
+        if missing:
+
+            rows.append(
+                {
+                    **row._asdict(),
+                    "test_valid":
+                        False,
+                    "decision":
+                        "KEEP — PREÇOS INSUFICIENTES",
+                }
+            )
+
+            continue
+
+        common_dates = (
+            returns[
+                comparison_tickers
+            ]
+            .dropna()
+            .index
+        )
+
+        if len(common_dates) < MIN_COMMON_DAYS:
+
+            rows.append(
+                {
+                    **row._asdict(),
+                    "test_valid":
+                        False,
+                    "observations":
+                        len(common_dates),
+                    "decision":
+                        "KEEP — HISTÓRICO INSUFICIENTE",
+                }
+            )
+
+            continue
+
+        comparison_returns = (
+            returns.loc[
+                common_dates
+            ]
+        )
+
+        original_metrics = (
+            _portfolio_risk_metrics(
+                current_tickers,
+                comparison_returns,
+            )
+        )
+
+        candidate_portfolio = [
+            challenger
+            if ticker == incumbent
+            else ticker
+            for ticker in current_tickers
+        ]
+
+        candidate_metrics = (
+            _portfolio_risk_metrics(
+                candidate_portfolio,
+                comparison_returns,
+            )
+        )
+
+        if (
+            original_metrics is None
+            or
+            candidate_metrics is None
+        ):
+
+            rows.append(
+                {
+                    **row._asdict(),
+                    "test_valid":
+                        False,
+                    "decision":
+                        "KEEP — TESTE INVÁLIDO",
+                }
+            )
+
+            continue
+
+        delta_volatility = (
+            candidate_metrics[
+                "volatility"
+            ]
+            -
+            original_metrics[
+                "volatility"
+            ]
+        )
+
+        delta_sharpe = (
+            candidate_metrics[
+                "sharpe"
+            ]
+            -
+            original_metrics[
+                "sharpe"
+            ]
+        )
+
+        delta_drawdown = (
+            candidate_metrics[
+                "max_drawdown"
+            ]
+            -
+            original_metrics[
+                "max_drawdown"
+            ]
+        )
+
+        delta_mean_corr = (
+            candidate_metrics[
+                "mean_correlation"
+            ]
+            -
+            original_metrics[
+                "mean_correlation"
+            ]
+        )
+
+        delta_max_risk = (
+            candidate_metrics[
+                "max_risk_contribution"
+            ]
+            -
+            original_metrics[
+                "max_risk_contribution"
+            ]
+        )
+
+        improve_vol = (
+            delta_volatility
+            <=
+            -VOL_IMPROVEMENT
+        )
+
+        improve_sharpe = (
+            delta_sharpe
+            >=
+            SHARPE_IMPROVEMENT
+        )
+
+        improve_drawdown = (
+            delta_drawdown
+            >=
+            DRAWDOWN_IMPROVEMENT
+        )
+
+        improve_corr = (
+            delta_mean_corr
+            <=
+            -CORRELATION_IMPROVEMENT
+        )
+
+        improve_risk_concentration = (
+            delta_max_risk
+            <=
+            -RISK_CONTRIBUTION_IMPROVEMENT
+        )
+
+        improvement_count = int(
+            sum(
+                [
+                    improve_vol,
+                    improve_sharpe,
+                    improve_drawdown,
+                    improve_corr,
+                    improve_risk_concentration,
+                ]
+            )
+        )
+
+        severe_deterioration = bool(
+            (
+                delta_volatility
+                >
+                MAX_VOL_DETERIORATION
+            )
+            or
+            (
+                delta_sharpe
+                <
+                -MAX_SHARPE_DETERIORATION
+            )
+            or
+            (
+                delta_drawdown
+                <
+                -MAX_DRAWDOWN_DETERIORATION
+            )
+        )
+
+        if not row.near_tie:
+
+            decision = (
+                "KEEP — VANTAGEM FUNDAMENTAL DO 5º"
+            )
+
+        elif severe_deterioration:
+
+            decision = (
+                "KEEP — TROCA PIORA A CARTEIRA"
+            )
+
+        elif (
+            improvement_count
+            >=
+            MIN_RISK_IMPROVEMENTS
+        ):
+
+            decision = (
+                "SWAP — 6º MELHORA RISCO COM SCORE EQUIVALENTE"
+            )
+
+        else:
+
+            decision = (
+                "KEEP — EVIDÊNCIA INSUFICIENTE PARA TROCA"
+            )
+
+        rows.append(
+            {
+                **row._asdict(),
+
+                "observations":
+                    original_metrics[
+                        "observations"
+                    ],
+
+                "baseline_vol":
+                    original_metrics[
+                        "volatility"
+                    ],
+
+                "candidate_vol":
+                    candidate_metrics[
+                        "volatility"
+                    ],
+
+                "delta_vol":
+                    delta_volatility,
+
+                "baseline_sharpe":
+                    original_metrics[
+                        "sharpe"
+                    ],
+
+                "candidate_sharpe":
+                    candidate_metrics[
+                        "sharpe"
+                    ],
+
+                "delta_sharpe":
+                    delta_sharpe,
+
+                "baseline_max_dd":
+                    original_metrics[
+                        "max_drawdown"
+                    ],
+
+                "candidate_max_dd":
+                    candidate_metrics[
+                        "max_drawdown"
+                    ],
+
+                "delta_max_dd":
+                    delta_drawdown,
+
+                "baseline_mean_corr":
+                    original_metrics[
+                        "mean_correlation"
+                    ],
+
+                "candidate_mean_corr":
+                    candidate_metrics[
+                        "mean_correlation"
+                    ],
+
+                "delta_mean_corr":
+                    delta_mean_corr,
+
+                "baseline_max_risk":
+                    original_metrics[
+                        "max_risk_contribution"
+                    ],
+
+                "candidate_max_risk":
+                    candidate_metrics[
+                        "max_risk_contribution"
+                    ],
+
+                "delta_max_risk":
+                    delta_max_risk,
+
+                "risk_improvements":
+                    improvement_count,
+
+                "severe_deterioration":
+                    severe_deterioration,
+
+                "test_valid":
+                    True,
+
+                "decision":
+                    decision,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _apply_boundary_decisions(
+    ranking: pd.DataFrame,
+    raw_portfolio: pd.DataFrame,
+    boundary_test: pd.DataFrame,
+) -> pd.DataFrame:
+
+    final_portfolio = (
+        raw_portfolio
         .copy()
+    )
+
+    if boundary_test.empty:
+        return final_portfolio
+
+    for row in boundary_test.itertuples(
+        index=False
+    ):
+
+        decision = str(
+            getattr(
+                row,
+                "decision",
+                "",
+            )
+        )
+
+        if not decision.startswith(
+            "SWAP"
+        ):
+            continue
+
+        sector = row.sector
+        incumbent = row.rank5_ticker
+        challenger = row.rank6_ticker
+
+        candidate = (
+            ranking[
+                (
+                    ranking["sector"]
+                    ==
+                    sector
+                )
+                &
+                (
+                    ranking["ticker"]
+                    ==
+                    challenger
+                )
+            ]
+            .head(1)
+            .copy()
+        )
+
+        if candidate.empty:
+            continue
+
+        final_portfolio = (
+            final_portfolio[
+                final_portfolio[
+                    "ticker"
+                ]
+                !=
+                incumbent
+            ]
+            .copy()
+        )
+
+        final_portfolio = pd.concat(
+            [
+                final_portfolio,
+                candidate,
+            ],
+            ignore_index=True,
+        )
+
+    final_portfolio = (
+        final_portfolio
+        .sort_values(
+            [
+                "sector",
+                "selection_score",
+            ],
+            ascending=[
+                True,
+                False,
+            ],
+        )
         .reset_index(drop=True)
     )
 
-    selected[
-        "selection_factor"
-    ] = (
-        SELECTION_FACTORS[
-            sector
-        ]
-    )
-
-    selected[
-        "selection_score"
-    ] = (
-        selected[
-            score_column
-        ]
-    )
-
-    selected[
+    final_portfolio[
         "selection_rank"
-    ] = np.arange(
-        1,
-        len(selected) + 1,
+    ] = (
+        final_portfolio
+        .groupby("sector")
+        .cumcount()
+        +
+        1
     )
 
-    selected[
+    final_portfolio[
         "selected"
     ] = True
 
-    return selected
+    return final_portfolio
 
 
 # ======================================================================================
-# 10. SELEÇÃO FINAL DAS 15 AÇÕES
+# 9. SELEÇÃO FINAL DAS 15 AÇÕES
 # ======================================================================================
 
 def select_portfolio(
     universe: pd.DataFrame,
     use_previous_portfolio: bool = True,
+    prices: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
+    """
+    Seleção final fiel ao estudo.
+
+    `use_previous_portfolio` é mantido na assinatura por compatibilidade,
+    mas NÃO controla mais a fronteira. A Célula 31 não usa persistência
+    automática do incumbente; usa o teste 5º x 6º baseado em risco.
+
+    Se `prices` for None:
+        retorna o Top 5 fundamental puro (pré-fronteira).
+
+    Se `prices` for informado:
+        executa o teste completo da Célula 31.
+    """
 
     validate_selection_factor_alignment()
 
@@ -1189,47 +1913,38 @@ def select_portfolio(
             "Universo precisa conter ticker e sector."
         )
 
-    universe = (
-        build_derived_metrics(
-            universe
-        )
+    ranking = _rank_all_sectors(
+        universe
     )
 
-    previous = (
-        load_previous_portfolio()
-        if use_previous_portfolio
-        else pd.DataFrame()
+    raw_portfolio = _build_raw_top5(
+        ranking
     )
 
-    selected_parts = []
+    if prices is None:
 
-    for sector in SECTORS:
+        portfolio = raw_portfolio
 
-        selected_sector = (
-            select_sector(
-                universe=universe,
-                sector=sector,
-                previous_portfolio=previous,
+    else:
+
+        boundary_test = (
+            _run_boundary_test(
+                ranking=ranking,
+                raw_portfolio=raw_portfolio,
+                prices=prices,
             )
         )
 
-        selected_parts.append(
-            selected_sector
+        portfolio = (
+            _apply_boundary_decisions(
+                ranking=ranking,
+                raw_portfolio=raw_portfolio,
+                boundary_test=boundary_test,
+            )
         )
 
-    portfolio = pd.concat(
-        selected_parts,
-        ignore_index=True,
-    )
-
-    # ------------------------------------------------------------------
-    # AUDITORIA — exatamente 15 tickers
-    # ------------------------------------------------------------------
-
     if (
-        portfolio[
-            "ticker"
-        ]
+        portfolio["ticker"]
         .nunique()
         !=
         15
@@ -1239,15 +1954,9 @@ def select_portfolio(
             "A carteira final não possui exatamente 15 tickers."
         )
 
-    # ------------------------------------------------------------------
-    # AUDITORIA — exatamente 5 por setor
-    # ------------------------------------------------------------------
-
     sector_counts = (
         portfolio
-        .groupby(
-            "sector"
-        )[
+        .groupby("sector")[
             "ticker"
         ]
         .nunique()
@@ -1255,7 +1964,7 @@ def select_portfolio(
 
     for sector in SECTORS:
 
-        expected = (
+        expected = int(
             SECTOR_TARGETS[
                 sector
             ]
@@ -1275,7 +1984,7 @@ def select_portfolio(
                 f"Esperado: {expected}."
             )
 
-    portfolio = (
+    return (
         portfolio
         .sort_values(
             [
@@ -1286,130 +1995,33 @@ def select_portfolio(
         .reset_index(drop=True)
     )
 
-    return portfolio
-
 
 # ======================================================================================
-# 11. AUDITORIA DA FRONTEIRA
+# 10. AUDITORIA DA FRONTEIRA
 # ======================================================================================
 
 def build_frontier_audit(
     universe: pd.DataFrame,
+    prices: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
 
-    universe = (
-        build_derived_metrics(
-            universe
-        )
+    ranking = _rank_all_sectors(
+        universe
     )
 
-    rows = []
+    raw_portfolio = _build_raw_top5(
+        ranking
+    )
 
-    for sector in SECTORS:
-
-        sector_df = (
-            universe[
-                universe[
-                    "sector"
-                ]
-                ==
-                sector
-            ]
-            .copy()
+    if prices is None:
+        return _boundary_rows(
+            ranking
         )
 
-        scored, score_column = (
-            score_sector(
-                sector_df,
-                sector,
-            )
-        )
-
-        scored = (
-            scored[
-                scored[
-                    score_column
-                ]
-                .notna()
-            ]
-            .sort_values(
-                score_column,
-                ascending=False,
-            )
-            .reset_index(drop=True)
-        )
-
-        if len(scored) < 6:
-            continue
-
-        rank5 = scored.iloc[4]
-        rank6 = scored.iloc[5]
-
-        score5 = float(
-            rank5[
-                score_column
-            ]
-        )
-
-        score6 = float(
-            rank6[
-                score_column
-            ]
-        )
-
-        relative_gap = (
-            (
-                score5
-                -
-                score6
-            )
-            /
-            max(
-                abs(score6),
-                1e-9,
-            )
-        )
-
-        rows.append(
-            {
-                "sector":
-                    sector,
-
-                "factor":
-                    SELECTION_FACTORS[
-                        sector
-                    ],
-
-                "rank5_ticker":
-                    rank5[
-                        "ticker"
-                    ],
-
-                "rank5_score":
-                    score5,
-
-                "rank6_ticker":
-                    rank6[
-                        "ticker"
-                    ],
-
-                "rank6_score":
-                    score6,
-
-                "relative_gap":
-                    relative_gap,
-
-                "frontier_material":
-                    (
-                        relative_gap
-                        >=
-                        FRONTIER_MIN_RELATIVE_GAP
-                    ),
-            }
-        )
-
-    return pd.DataFrame(
-        rows
+    return _run_boundary_test(
+        ranking=ranking,
+        raw_portfolio=raw_portfolio,
+        prices=prices,
     )
 
 
