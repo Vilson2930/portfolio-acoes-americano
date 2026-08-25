@@ -145,6 +145,8 @@ def validate_ranking(
         "ticker",
         "sector",
         "entry_signal",
+        "sector_weight",
+        "stock_weight",
     }
 
     missing = (
@@ -549,6 +551,36 @@ def build_summary_table(
         ],
 
         [
+            "Peso Health Care",
+            format_pct(
+                ranking.loc[
+                    ranking["sector"] == "Health Care",
+                    "stock_weight",
+                ].sum()
+            ),
+        ],
+
+        [
+            "Peso Industrials",
+            format_pct(
+                ranking.loc[
+                    ranking["sector"] == "Industrials",
+                    "stock_weight",
+                ].sum()
+            ),
+        ],
+
+        [
+            "Peso Information Technology",
+            format_pct(
+                ranking.loc[
+                    ranking["sector"] == "Information Technology",
+                    "stock_weight",
+                ].sum()
+            ),
+        ],
+
+        [
             "Entradas fortes",
             str(
                 summary[
@@ -669,6 +701,7 @@ def build_ranking_table(
         "Fundamentos",
         "Score",
         "Percentil",
+        "Peso",
         "Entrada",
     ]
 
@@ -728,6 +761,12 @@ def build_ranking_table(
                     )
                 ),
 
+                format_pct(
+                    row.get(
+                        "stock_weight"
+                    )
+                ),
+
                 safe_text(
                     row.get(
                         "entry_signal"
@@ -746,9 +785,10 @@ def build_ranking_table(
             22 * mm,
             20 * mm,
             24 * mm,
-            16 * mm,
-            18 * mm,
-            30 * mm,
+            15 * mm,
+            17 * mm,
+            14 * mm,
+            27 * mm,
         ],
     )
 
@@ -800,14 +840,14 @@ def build_ranking_table(
         (
             "ALIGN",
             (6, 1),
-            (7, -1),
+            (8, -1),
             "CENTER",
         ),
 
         (
             "ALIGN",
-            (8, 1),
-            (8, -1),
+            (9, 1),
+            (9, -1),
             "CENTER",
         ),
     ]
@@ -828,8 +868,8 @@ def build_ranking_table(
             style_commands.append(
                 (
                     "FONTNAME",
-                    (8, index),
-                    (8, index),
+                    (9, index),
+                    (9, index),
                     "Helvetica-Bold",
                 )
             )
@@ -839,8 +879,8 @@ def build_ranking_table(
             style_commands.append(
                 (
                     "FONTNAME",
-                    (8, index),
-                    (8, index),
+                    (9, index),
+                    (9, index),
                     "Helvetica-Bold",
                 )
             )
@@ -895,6 +935,7 @@ def build_sector_table(
         "Desconto",
         "Fundamentos",
         "Percentil",
+        "Peso",
         "Sinal",
     ]
 
@@ -948,6 +989,12 @@ def build_sector_table(
                     )
                 ),
 
+                format_pct(
+                    row.get(
+                        "stock_weight"
+                    )
+                ),
+
                 safe_text(
                     row.get(
                         "entry_signal"
@@ -965,9 +1012,10 @@ def build_sector_table(
             20 * mm,
             28 * mm,
             25 * mm,
-            30 * mm,
-            20 * mm,
-            35 * mm,
+            28 * mm,
+            18 * mm,
+            16 * mm,
+            31 * mm,
         ],
     )
 
@@ -1098,6 +1146,12 @@ def build_stock_explanation(
         )
     )
 
+    stock_weight = format_pct(
+        row.get(
+            "stock_weight"
+        )
+    )
+
     if signal == "ENTRADA FORTE":
 
         interpretation = (
@@ -1140,7 +1194,8 @@ def build_stock_explanation(
         f"<b>Desconto:</b> {discount}. "
         f"<b>Fundamentos:</b> {fundamentals}. "
         f"<b>Score final:</b> {final_score}. "
-        f"<b>Percentil:</b> {percentile}."
+        f"<b>Percentil:</b> {percentile}. "
+        f"<b>Peso na carteira:</b> {stock_weight}."
     )
 
     return Paragraph(
@@ -1274,7 +1329,13 @@ def generate_pdf(
         "Momentum 6M + 12M.<br/><br/>"
         "Estrutura fixa: 3 setores, 5 ações por setor, "
         "15 ações totais. Os tickers podem mudar conforme "
-        "o ranking fundamental."
+        "o ranking fundamental.<br/><br/>"
+        "<b>Alocação de capital aprovada pelo estudo:</b><br/>"
+        "Health Care: 25% da carteira → 5% por ação.<br/>"
+        "Industrials: 25% da carteira → 5% por ação.<br/>"
+        "Information Technology: 50% da carteira → 10% por ação.<br/>"
+        "Os pesos são definidos por setor e divididos igualmente "
+        "entre as cinco ações selecionadas de cada setor."
     )
 
     story.append(
@@ -1497,7 +1558,12 @@ def generate_pdf(
                 "e momento de entrada. Uma empresa pode permanecer entre "
                 "as 15 selecionadas e, ao mesmo tempo, receber AGUARDAR "
                 "ou NÃO COMPRAR AGORA. O sinal de entrada não remove "
-                "automaticamente a empresa da carteira."
+                "automaticamente a empresa da carteira.<br/><br/>"
+                "<b>Alocação:</b> os pesos de capital são independentes do sinal "
+                "de entrada. Health Care recebe 25%, Industrials 25% e "
+                "Information Technology 50%. Como cada setor possui cinco ações, "
+                "cada ação de Health Care e Industrials recebe 5% da carteira e "
+                "cada ação de Information Technology recebe 10%."
             ),
             styles[
                 "body"
