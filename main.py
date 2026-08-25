@@ -1,6 +1,6 @@
 # ======================================================================================
 # PORTFOLIO ACOES AMERICANO
-# main.py — VERSÃO CORRIGIDA PARA ENTRY HISTÓRICO
+# main.py — PIPELINE FIEL AO ESTUDO
 # ======================================================================================
 
 from __future__ import annotations
@@ -20,135 +20,448 @@ from data import (
     download_prices,
 )
 
-from selection import select_portfolio, build_frontier_audit
-from entry import classify_portfolio_entries, audit_entry_ranking
+from selection import (
+    select_portfolio,
+    build_frontier_audit,
+    get_boundary_test_tickers,
+)
+
+from entry import (
+    classify_portfolio_entries,
+    audit_entry_ranking,
+)
+
 from report import generate_reports
 
 
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(OUTPUT_DIR).mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
-def print_header(title: str):
-    print("\n" + "=" * 110)
+def print_header(
+    title: str,
+):
+    print(
+        "\n"
+        +
+        "=" * 110
+    )
+
     print(title)
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
 
 def run():
 
     started_at = datetime.now()
 
-    print_header("PORTFOLIO ACOES AMERICANO — EXECUÇÃO DIÁRIA")
-
-    # 1. CONFIG
-    print_header("1. CONFIGURAÇÃO")
-    validate_config()
-    print("Configuração validada.")
-
-    # 2. UNIVERSO
-    print_header("2. UNIVERSO")
-    universe = build_base_universe()
-    print(f"Empresas no universo: {len(universe):,}")
-
-    # 3. SETORES
-    print_header("3. CLASSIFICAÇÃO SETORIAL")
-    universe = enrich_sectors(universe)
-    universe = filter_target_sectors(universe)
-
-    counts = universe["sector"].value_counts()
-    for sector in SECTORS:
-        print(f"  {sector:<28} {int(counts.get(sector, 0)):,}")
-
-    # 4. FUNDAMENTOS
-    print_header("4. FUNDAMENTOS SEC")
-    fundamentals, fundamental_errors = download_fundamentals(
-        universe=universe,
-        use_cache=True,
+    print_header(
+        "PORTFOLIO ACOES AMERICANO — EXECUÇÃO DIÁRIA"
     )
 
-    print(f"Observações fundamentais: {len(fundamentals):,}")
-    print(f"Empresas com erro: {len(fundamental_errors):,}")
+    # ==================================================================================
+    # 1. CONFIG
+    # ==================================================================================
+
+    print_header(
+        "1. CONFIGURAÇÃO"
+    )
+
+    validate_config()
+
+    print(
+        "Configuração validada."
+    )
+
+    # ==================================================================================
+    # 2. UNIVERSO
+    # ==================================================================================
+
+    print_header(
+        "2. UNIVERSO"
+    )
+
+    universe = (
+        build_base_universe()
+    )
+
+    print(
+        f"Empresas no universo: "
+        f"{len(universe):,}"
+    )
+
+    # ==================================================================================
+    # 3. SETORES
+    # ==================================================================================
+
+    print_header(
+        "3. CLASSIFICAÇÃO SETORIAL"
+    )
+
+    universe = (
+        enrich_sectors(
+            universe
+        )
+    )
+
+    universe = (
+        filter_target_sectors(
+            universe
+        )
+    )
+
+    counts = (
+        universe[
+            "sector"
+        ]
+        .value_counts()
+    )
+
+    for sector in SECTORS:
+
+        print(
+            f"  {sector:<28} "
+            f"{int(counts.get(sector, 0)):,}"
+        )
+
+    # ==================================================================================
+    # 4. FUNDAMENTOS
+    # ==================================================================================
+
+    print_header(
+        "4. FUNDAMENTOS SEC"
+    )
+
+    fundamentals, fundamental_errors = (
+        download_fundamentals(
+            universe=universe,
+            use_cache=True,
+        )
+    )
+
+    print(
+        f"Observações fundamentais: "
+        f"{len(fundamentals):,}"
+    )
+
+    print(
+        f"Empresas com erro: "
+        f"{len(fundamental_errors):,}"
+    )
 
     if fundamentals.empty:
-        raise RuntimeError("Nenhum fundamento SEC foi obtido.")
 
-    # 5. SNAPSHOT ATUAL PARA SELEÇÃO
-    print_header("5. SNAPSHOT FUNDAMENTAL")
-    today = pd.Timestamp.today().normalize()
+        raise RuntimeError(
+            "Nenhum fundamento SEC foi obtido."
+        )
 
-    snapshot = prepare_selection_snapshot(
-        universe=universe,
-        fundamentals=fundamentals,
-        as_of_date=today,
+    # ==================================================================================
+    # 5. SNAPSHOT
+    # ==================================================================================
+
+    print_header(
+        "5. SNAPSHOT FUNDAMENTAL"
     )
 
-    print(f"Empresas no snapshot: {len(snapshot):,}")
+    today = (
+        pd.Timestamp.today()
+        .normalize()
+    )
 
-    # 6. SELEÇÃO
-    print_header("6. SELEÇÃO FUNDAMENTAL — TOP 5 POR SETOR")
-    portfolio = select_portfolio(
-        universe=snapshot,
-        use_previous_portfolio=True,
+    snapshot = (
+        prepare_selection_snapshot(
+            universe=universe,
+            fundamentals=fundamentals,
+            as_of_date=today,
+        )
+    )
+
+    print(
+        f"Empresas no snapshot: "
+        f"{len(snapshot):,}"
+    )
+
+    # ==================================================================================
+    # 6. SELEÇÃO FUNDAMENTAL PURA
+    # ==================================================================================
+
+    print_header(
+        "6. SELEÇÃO FUNDAMENTAL — TOP 5 PURO"
+    )
+
+    preliminary_portfolio = (
+        select_portfolio(
+            universe=snapshot,
+            use_previous_portfolio=False,
+            prices=None,
+        )
     )
 
     for sector in SECTORS:
-        tickers = portfolio.loc[
-            portfolio["sector"] == sector,
-            "ticker",
-        ].tolist()
-        print(f"  {sector:<28}: {', '.join(tickers)}")
 
-    # 7. FRONTEIRA
-    print_header("7. AUDITORIA DA FRONTEIRA")
-    frontier = build_frontier_audit(snapshot)
-    if frontier.empty:
-        print("Sem auditoria disponível.")
-    else:
-        print(frontier.to_string(index=False))
+        tickers = (
+            preliminary_portfolio.loc[
+                preliminary_portfolio[
+                    "sector"
+                ]
+                ==
+                sector,
+                "ticker",
+            ]
+            .tolist()
+        )
 
+        print(
+            f"  {sector:<28}: "
+            f"{', '.join(tickers)}"
+        )
+
+    # ==================================================================================
+    # 7. CANDIDATOS DA FRONTEIRA 5º x 6º
+    # ==================================================================================
+
+    print_header(
+        "7. FRONTEIRA FUNDAMENTAL — 5º VS 6º"
+    )
+
+    frontier_pre = (
+        build_frontier_audit(
+            snapshot,
+            prices=None,
+        )
+    )
+
+    print(
+        frontier_pre.to_string(
+            index=False
+        )
+    )
+
+    test_tickers = (
+        get_boundary_test_tickers(
+            snapshot
+        )
+    )
+
+    print(
+        f"\nTickers necessários para o teste: "
+        f"{len(test_tickers)}"
+    )
+
+    print(
+        ", ".join(
+            test_tickers
+        )
+    )
+
+    # ==================================================================================
     # 8. PREÇOS
-    print_header("8. PREÇOS")
-    selected_tickers = portfolio["ticker"].tolist()
+    #
+    # Baixamos Top-5 + candidatos 6º antes de fechar a carteira.
+    # O início em 2013 atende também o Entry Engine.
+    # A fronteira usa internamente apenas dados >= 2024-01-01,
+    # exatamente como a Célula 31.
+    # ==================================================================================
 
-    # 2013 garante janela para indicadores de 3 anos antes dos snapshots úteis.
-    prices = download_prices(
-        tickers=selected_tickers,
-        start="2013-01-01",
+    print_header(
+        "8. PREÇOS — CARTEIRA + CANDIDATOS DA FRONTEIRA"
     )
 
-    print(f"Tickers com preços: {len(prices.columns)}")
-    print(f"Primeira data: {prices.index.min().date()}")
-    print(f"Última data: {prices.index.max().date()}")
-
-    # 9. ENTRY — AGORA COM HISTÓRICO POINT-IN-TIME
-    print_header("9. CLASSIFICAÇÃO DE ENTRADA — HISTÓRICO CÉLULA 41")
-
-    ranking = classify_portfolio_entries(
-        portfolio=portfolio,
-        prices=prices,
-        fundamentals_history=fundamentals,
-        as_of_date=today,
+    prices_all = (
+        download_prices(
+            tickers=test_tickers,
+            start="2013-01-01",
+        )
     )
 
-    audit = audit_entry_ranking(ranking)
+    print(
+        f"Tickers com preços: "
+        f"{len(prices_all.columns)}"
+    )
 
-    print("\nAuditoria:")
-    print(f"  Ações               : {audit['number_of_stocks']}")
-    print(f"  Setores              : {audit['number_of_sectors']}")
-    print(f"  Entrada Forte        : {audit['entry_strong']}")
-    print(f"  Entrada              : {audit['entry']}")
-    print(f"  Aguardar             : {audit['wait']}")
-    print(f"  Não comprar agora    : {audit['do_not_buy']}")
-    print(f"  Estrutura OK         : {audit['structure_ok']}")
+    print(
+        f"Primeira data: "
+        f"{prices_all.index.min().date()}"
+    )
 
-    if not audit["structure_ok"]:
-        raise RuntimeError("Auditoria final da carteira falhou.")
+    print(
+        f"Última data: "
+        f"{prices_all.index.max().date()}"
+    )
 
-    # 10. RANKING
-    print_header("10. RANKING FINAL")
+    # ==================================================================================
+    # 9. TESTE FINAL DA FRONTEIRA — CÉLULA 31
+    # ==================================================================================
+
+    print_header(
+        "9. TESTE FINAL DA FRONTEIRA — CÉLULA 31"
+    )
+
+    frontier = (
+        build_frontier_audit(
+            snapshot,
+            prices=prices_all,
+        )
+    )
+
+    print(
+        frontier.to_string(
+            index=False
+        )
+    )
+
+    # ==================================================================================
+    # 10. CARTEIRA FINAL 15 AÇÕES
+    # ==================================================================================
+
+    print_header(
+        "10. CARTEIRA FINAL — APÓS FRONTEIRA"
+    )
+
+    portfolio = (
+        select_portfolio(
+            universe=snapshot,
+            use_previous_portfolio=False,
+            prices=prices_all,
+        )
+    )
+
+    for sector in SECTORS:
+
+        tickers = (
+            portfolio.loc[
+                portfolio[
+                    "sector"
+                ]
+                ==
+                sector,
+                "ticker",
+            ]
+            .tolist()
+        )
+
+        print(
+            f"  {sector:<28}: "
+            f"{', '.join(tickers)}"
+        )
+
+    # ==================================================================================
+    # 11. PREÇOS DA CARTEIRA FINAL PARA ENTRY
+    # ==================================================================================
+
+    selected_tickers = (
+        portfolio[
+            "ticker"
+        ]
+        .tolist()
+    )
+
+    missing_final = [
+        ticker
+        for ticker in selected_tickers
+        if ticker not in prices_all.columns
+    ]
+
+    if missing_final:
+
+        raise RuntimeError(
+            f"Tickers finais sem preço: "
+            f"{missing_final}"
+        )
+
+    prices = (
+        prices_all[
+            selected_tickers
+        ]
+        .copy()
+    )
+
+    # ==================================================================================
+    # 12. ENTRY — HISTÓRICO POINT-IN-TIME
+    # ==================================================================================
+
+    print_header(
+        "11. CLASSIFICAÇÃO DE ENTRADA — HISTÓRICO CÉLULA 41"
+    )
+
+    ranking = (
+        classify_portfolio_entries(
+            portfolio=portfolio,
+            prices=prices,
+            fundamentals_history=fundamentals,
+            as_of_date=today,
+        )
+    )
+
+    audit = (
+        audit_entry_ranking(
+            ranking
+        )
+    )
+
+    print(
+        "\nAuditoria:"
+    )
+
+    print(
+        f"  Ações               : "
+        f"{audit['number_of_stocks']}"
+    )
+
+    print(
+        f"  Setores              : "
+        f"{audit['number_of_sectors']}"
+    )
+
+    print(
+        f"  Entrada Forte        : "
+        f"{audit['entry_strong']}"
+    )
+
+    print(
+        f"  Entrada              : "
+        f"{audit['entry']}"
+    )
+
+    print(
+        f"  Aguardar             : "
+        f"{audit['wait']}"
+    )
+
+    print(
+        f"  Não comprar agora    : "
+        f"{audit['do_not_buy']}"
+    )
+
+    print(
+        f"  Estrutura OK         : "
+        f"{audit['structure_ok']}"
+    )
+
+    if not audit[
+        "structure_ok"
+    ]:
+
+        raise RuntimeError(
+            "Auditoria final da carteira falhou."
+        )
+
+    # ==================================================================================
+    # 13. RANKING FINAL
+    # ==================================================================================
+
+    print_header(
+        "12. RANKING FINAL"
+    )
 
     columns = [
-        c for c in [
+        c
+        for c in [
             "sector",
             "buy_priority_sector",
             "ticker",
@@ -166,28 +479,65 @@ def run():
         if c in ranking.columns
     ]
 
-    print(ranking[columns].to_string(index=False))
+    print(
+        ranking[
+            columns
+        ]
+        .to_string(
+            index=False
+        )
+    )
 
-    # 11. RELATÓRIOS
-    print_header("11. RELATÓRIOS")
-    files = generate_reports(
-        ranking=ranking,
-        generated_at=started_at,
+    # ==================================================================================
+    # 14. RELATÓRIOS
+    # ==================================================================================
+
+    print_header(
+        "13. RELATÓRIOS"
+    )
+
+    files = (
+        generate_reports(
+            ranking=ranking,
+            generated_at=started_at,
+        )
     )
 
     for name, path in files.items():
-        print(f"{name:<22}: {path}")
+
+        print(
+            f"{name:<22}: "
+            f"{path}"
+        )
 
     finished_at = datetime.now()
 
-    print_header("EXECUÇÃO CONCLUÍDA")
-    print(f"Início          : {started_at.strftime('%d/%m/%Y %H:%M:%S')}")
-    print(f"Fim             : {finished_at.strftime('%d/%m/%Y %H:%M:%S')}")
-    print(f"Tempo total     : {finished_at - started_at}")
-    print("\nSTATUS: SUCESSO")
+    print_header(
+        "EXECUÇÃO CONCLUÍDA"
+    )
+
+    print(
+        f"Início          : "
+        f"{started_at.strftime('%d/%m/%Y %H:%M:%S')}"
+    )
+
+    print(
+        f"Fim             : "
+        f"{finished_at.strftime('%d/%m/%Y %H:%M:%S')}"
+    )
+
+    print(
+        f"Tempo total     : "
+        f"{finished_at - started_at}"
+    )
+
+    print(
+        "\nSTATUS: SUCESSO"
+    )
 
     return ranking
 
 
 if __name__ == "__main__":
+
     run()
