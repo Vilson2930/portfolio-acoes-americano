@@ -36,7 +36,8 @@ jobs:
           python -m py_compile data.py
           python -m py_compile selection.py
           python -m py_compile main.py
+          python -m py_compile audit_boundary.py
 
       - name: Run boundary validation
         run: |
-          python main.py
+          python audit_boundary.py
