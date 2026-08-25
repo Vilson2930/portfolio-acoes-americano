@@ -73,9 +73,14 @@ SECTORS = [
 #     Growth
 #
 # Information Technology
-#     Quality
+#     Financial Strength
 #
 # Esses fatores determinam QUAIS ações entram no Top 5.
+#
+# Regra vencedora validada nas Células 15, 16 e 17 do estudo:
+#     Health Care              -> Financial Strength
+#     Industrials              -> Growth
+#     Information Technology   -> Financial Strength
 #
 # ======================================================================================
 
@@ -88,7 +93,7 @@ SELECTION_FACTORS = {
         "growth",
 
     "Information Technology":
-        "quality",
+        "financial_strength",
 }
 
 
@@ -423,12 +428,38 @@ def validate_config():
         )
 
 
+    expected_selection_factors = {
+
+        "Health Care":
+            "financial_strength",
+
+        "Industrials":
+            "growth",
+
+        "Information Technology":
+            "financial_strength",
+    }
+
+
     for sector in SECTORS:
 
         if sector not in SELECTION_FACTORS:
 
             raise RuntimeError(
                 f"Fator de seleção ausente para {sector}"
+            )
+
+
+        if (
+            SELECTION_FACTORS[sector]
+            !=
+            expected_selection_factors[sector]
+        ):
+
+            raise RuntimeError(
+                f"Fator de seleção divergente do estudo em {sector}: "
+                f"{SELECTION_FACTORS[sector]} != "
+                f"{expected_selection_factors[sector]}"
             )
 
 
