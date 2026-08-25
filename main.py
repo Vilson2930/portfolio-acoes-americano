@@ -31,6 +31,11 @@ from entry import (
     audit_entry_ranking,
 )
 
+from allocation import (
+    apply_portfolio_weights,
+    audit_portfolio_weights,
+)
+
 from report import generate_reports
 
 
@@ -452,11 +457,84 @@ def run():
         )
 
     # ==================================================================================
-    # 13. RANKING FINAL
+    # 13. ALOCAÇÃO DE CAPITAL — ESTUDO CIENTÍFICO
     # ==================================================================================
 
     print_header(
-        "12. RANKING FINAL"
+        "12. ALOCAÇÃO DE CAPITAL"
+    )
+
+    ranking = (
+        apply_portfolio_weights(
+            ranking
+        )
+    )
+
+    allocation_audit = (
+        audit_portfolio_weights(
+            ranking
+        )
+    )
+
+    allocation_summary = (
+        ranking
+        .groupby(
+            "sector"
+        )
+        .agg(
+            stocks=(
+                "ticker",
+                "nunique",
+            ),
+            sector_weight=(
+                "stock_weight",
+                "sum",
+            ),
+            stock_weight=(
+                "stock_weight",
+                "first",
+            ),
+        )
+        .reset_index()
+    )
+
+    print(
+        "\nPesos aprovados pelo estudo:"
+    )
+
+    for _, row in allocation_summary.iterrows():
+
+        print(
+            f"  {row['sector']:<28}"
+            f"{float(row['sector_weight']):>7.2%} "
+            f"| {int(row['stocks'])} ações "
+            f"× {float(row['stock_weight']):.2%}"
+        )
+
+    print(
+        f"\nPeso total da carteira   : "
+        f"{allocation_audit['total_weight']:.2%}"
+    )
+
+    print(
+        f"Alocação válida           : "
+        f"{allocation_audit['allocation_ok']}"
+    )
+
+    if not allocation_audit[
+        "allocation_ok"
+    ]:
+
+        raise RuntimeError(
+            "Falha na auditoria da alocação."
+        )
+
+    # ==================================================================================
+    # 14. RANKING FINAL
+    # ==================================================================================
+
+    print_header(
+        "13. RANKING FINAL"
     )
 
     columns = [
@@ -474,6 +552,8 @@ def run():
             "fundamental_preservation_score",
             "final_signal_score",
             "signal_percentile",
+            "sector_weight",
+            "stock_weight",
             "entry_signal",
         ]
         if c in ranking.columns
@@ -489,11 +569,11 @@ def run():
     )
 
     # ==================================================================================
-    # 14. RELATÓRIOS
+    # 15. RELATÓRIOS
     # ==================================================================================
 
     print_header(
-        "13. RELATÓRIOS"
+        "14. RELATÓRIOS"
     )
 
     files = (
