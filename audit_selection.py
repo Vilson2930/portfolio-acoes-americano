@@ -5,51 +5,34 @@
 #
 # OBJETIVO
 # --------
-# Auditar a SELEÇÃO FUNDAMENTAL atual do GitHub contra a metodologia congelada
-# da CÉLULA 28 e a auditoria de fronteira da CÉLULA 29.
+# Auditar a seleção fundamental atual do GitHub contra a regra vencedora
+# confirmada nas Células 15 e 16 do estudo.
 #
-# Este arquivo NÃO altera:
-#   • data.py
-#   • selection.py
-#   • entry.py
-#   • config.py
-#   • pesos
-#   • thresholds
-#   • carteira persistida
+# REGRA VENCEDORA
+# ----------------
+# Health Care              -> Financial Strength
+# Industrials              -> Growth
+# Information Technology   -> Financial Strength
 #
-# Ele apenas compara:
+# Financial Strength:
+#   cash_assets ↑
+#   debt_assets ↓
+#   debt_equity ↓
 #
-#   CÉLULA 28 (referência)
-#       Health Care              -> Financial Strength
-#       Industrials              -> Growth
-#       Information Technology   -> Quality
+# Growth:
+#   revenue_growth ↑
+#   eps_growth ↑
+#   operating_cash_flow_growth ↑
 #
-#   CÉLULA 28 — componentes:
+# Metodologia:
+#   • winsorização P5-P95 dentro do setor
+#   • percentis dentro do setor
+#   • score = MÉDIA dos componentes válidos
+#   • mínimo 2 componentes
+#   • ranking decrescente
+#   • Top 5 por setor
 #
-#       Financial Strength
-#           higher: cash_assets
-#           lower : debt_assets, debt_equity
-#           mínimo: 2 componentes
-#
-#       Growth
-#           higher: revenue_growth, eps_growth,
-#                   operating_cash_flow_growth
-#           mínimo: 2 componentes
-#
-#       Quality
-#           higher: roa, roe, operating_margin, net_margin
-#           mínimo: 3 componentes
-#
-#   CÉLULA 28 — transformação:
-#       • winsorização P5/P95 dentro do setor;
-#       • percentil dentro do setor;
-#       • menor dívida = melhor;
-#       • score do fator = MÉDIA dos percentis válidos;
-#       • ranking decrescente;
-#       • Top 5 por setor.
-#
-# Também compara com a implementação atual de selection.py.
-#
+# Este arquivo NÃO altera o motor.
 # ======================================================================================
 
 from __future__ import annotations
@@ -58,7 +41,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import SECTORS
+from config import (
+    SECTORS,
+    SELECTION_FACTORS,
+    SECTOR_TARGETS,
+)
 
 from data import (
     build_base_universe,
@@ -70,652 +57,201 @@ from data import (
 
 from selection import (
     build_derived_metrics,
-    ensure_growth_metrics,
     score_sector,
-    select_portfolio,
-    build_frontier_audit,
 )
 
 
 # ======================================================================================
-# 1. CONFIGURAÇÕES
+# 1. CONFIGURAÇÃO
 # ======================================================================================
 
 REFERENCE_DATE = pd.Timestamp("2026-08-24")
 
-TARGET_SECTORS = [
-    "Health Care",
-    "Industrials",
-    "Information Technology",
-]
-
-N_PER_SECTOR = 5
-
-MIN_FACTOR_COMPONENTS = {
-    "financial_strength": 2,
-    "growth": 2,
-    "quality": 3,
+EXPECTED_FACTORS = {
+    "Health Care": "financial_strength",
+    "Industrials": "growth",
+    "Information Technology": "financial_strength",
 }
 
-SECTOR_FACTOR = {
-    "Health Care": "financial_strength_score",
-    "Industrials": "growth_score",
-    "Information Technology": "quality_score",
+FACTOR_COMPONENTS = {
+    "financial_strength": {
+        "higher": [
+            "cash_assets",
+        ],
+        "lower": [
+            "debt_assets",
+            "debt_equity",
+        ],
+        "minimum_components": 2,
+    },
+
+    "growth": {
+        "higher": [
+            "revenue_growth",
+            "eps_growth",
+            "operating_cash_flow_growth",
+        ],
+        "lower": [],
+        "minimum_components": 2,
+    },
 }
 
 OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_COMPARISON = (
-    OUTPUT_DIR
-    / "audit_selection_comparison.csv"
-)
-
-OUTPUT_REFERENCE_RANKING = (
-    OUTPUT_DIR
-    / "audit_selection_cell28_ranking.csv"
-)
-
-OUTPUT_GITHUB_RANKING = (
-    OUTPUT_DIR
-    / "audit_selection_github_ranking.csv"
-)
-
-OUTPUT_FRONTIER = (
-    OUTPUT_DIR
-    / "audit_selection_frontier.csv"
-)
+OUTPUT_COMPARISON = OUTPUT_DIR / "audit_selection_comparison.csv"
+OUTPUT_REFERENCE = OUTPUT_DIR / "audit_selection_reference.csv"
+OUTPUT_GITHUB = OUTPUT_DIR / "audit_selection_github.csv"
 
 
 # ======================================================================================
 # 2. HELPERS
 # ======================================================================================
 
-def header(
-    title: str,
-):
-    print(
-        "\n"
-        +
-        "=" * 145
-    )
-
-    print(
-        title
-    )
-
-    print(
-        "=" * 145
-    )
+def header(title: str):
+    print("\n" + "=" * 145)
+    print(title)
+    print("=" * 145)
 
 
-def normalize_ticker(
-    value,
-):
+def normalize_ticker(value):
     return (
         str(value)
         .strip()
         .upper()
-        .replace(
-            ".",
-            "-",
-        )
+        .replace(".", "-")
     )
 
 
-def winsorize_cell28(
-    series: pd.Series,
-) -> pd.Series:
-    """
-    Regra exata da Célula 28.
+def winsorize_reference(series: pd.Series) -> pd.Series:
 
-    • coerção numérica;
-    • se menos de 10 válidos, não winsoriza;
-    • caso contrário, clip P5/P95.
-    """
-
-    series = pd.to_numeric(
+    values = pd.to_numeric(
         series,
         errors="coerce",
     )
 
-    valid = (
-        series
-        .dropna()
-    )
+    valid = values.dropna()
 
     if len(valid) < 10:
-        return series
+        return values
 
-    lower = valid.quantile(
-        0.05
+    p05 = valid.quantile(0.05)
+    p95 = valid.quantile(0.95)
+
+    return values.clip(
+        lower=p05,
+        upper=p95,
     )
-
-    upper = valid.quantile(
-        0.95
-    )
-
-    return series.clip(
-        lower=lower,
-        upper=upper,
-    )
-
-
-def prepare_cell28_aliases(
-    snapshot: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Traduz os nomes atuais do GitHub para os nomes usados na Célula 28.
-
-    A tradução NÃO muda nenhuma fórmula econômica.
-    """
-
-    df = (
-        build_derived_metrics(
-            snapshot
-        )
-    )
-
-    df = (
-        ensure_growth_metrics(
-            df
-        )
-    )
-
-    # --------------------------------------------------------------
-    # aliases da Célula 28
-    # --------------------------------------------------------------
-
-    aliases = {
-        "cash_assets":
-            "cash_to_assets",
-
-        "debt_assets":
-            "debt_to_assets",
-
-        "debt_equity":
-            "debt_to_equity",
-
-        "revenue_growth":
-            "revenue_growth_yoy",
-
-        "eps_growth":
-            "diluted_eps_growth_yoy",
-
-        "operating_cash_flow_growth":
-            "operating_cash_flow_growth_yoy",
-    }
-
-    for target, source in aliases.items():
-
-        if source in df.columns:
-
-            df[
-                target
-            ] = pd.to_numeric(
-                df[
-                    source
-                ],
-                errors="coerce",
-            )
-
-        else:
-
-            df[
-                target
-            ] = np.nan
-
-    return df
 
 
 # ======================================================================================
-# 3. REPRODUÇÃO INDEPENDENTE DA CÉLULA 28
+# 3. REPRODUÇÃO INDEPENDENTE DA REGRA DO ESTUDO
 # ======================================================================================
 
-FACTOR_DEFINITIONS = {
-
-    "financial_strength": {
-
-        "higher": [
-            "cash_assets",
-        ],
-
-        "lower": [
-            "debt_assets",
-            "debt_equity",
-        ],
-    },
-
-    "growth": {
-
-        "higher": [
-            "revenue_growth",
-            "eps_growth",
-            "operating_cash_flow_growth",
-        ],
-
-        "lower": [],
-    },
-
-    "quality": {
-
-        "higher": [
-            "roa",
-            "roe",
-            "operating_margin",
-            "net_margin",
-        ],
-
-        "lower": [],
-    },
-}
-
-
-ALL_METRICS = sorted(
-    {
-        metric
-
-        for definition
-        in FACTOR_DEFINITIONS.values()
-
-        for direction
-        in [
-            "higher",
-            "lower",
-        ]
-
-        for metric
-        in definition[
-            direction
-        ]
-    }
-)
-
-
-LOWER_IS_BETTER = {
-    "debt_assets",
-    "debt_equity",
-}
-
-
-def reproduce_cell28(
+def build_reference_ranking(
     snapshot: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Implementação independente da Célula 28.
 
-    IMPORTANTE:
-    esta função NÃO chama score_sector() para calcular os scores de referência.
-    Assim, ela consegue detectar divergência entre a metodologia original e
-    selection.py.
-    """
-
-    current = (
-        prepare_cell28_aliases(
-            snapshot
-        )
+    base = build_derived_metrics(
+        snapshot
     )
 
-    current[
-        "ticker"
-    ] = (
-        current[
-            "ticker"
+    base["ticker"] = (
+        base["ticker"]
+        .map(normalize_ticker)
+    )
+
+    parts = []
+
+    for sector in SECTORS:
+
+        factor = EXPECTED_FACTORS[
+            sector
         ]
-        .map(
-            normalize_ticker
-        )
-    )
 
-    current = (
-        current[
-            current[
-                "sector"
-            ]
-            .isin(
-                TARGET_SECTORS
-            )
+        definition = FACTOR_COMPONENTS[
+            factor
         ]
-        .copy()
-    )
 
-    # ------------------------------------------------------------------
-    # Winsorização P5/P95 dentro do setor
-    # ------------------------------------------------------------------
-
-    for metric in ALL_METRICS:
-
-        if metric not in current.columns:
-
-            current[
-                metric
-            ] = np.nan
-
-        current[
-            f"{metric}_winsor"
-        ] = (
-            current
-            .groupby(
-                "sector"
-            )[
-                metric
+        sector_df = (
+            base[
+                base["sector"] == sector
             ]
-            .transform(
-                winsorize_cell28
-            )
+            .copy()
         )
 
-    # ------------------------------------------------------------------
-    # Percentis dentro do setor
-    # ------------------------------------------------------------------
-
-    for metric in ALL_METRICS:
-
-        winsor_col = (
-            f"{metric}_winsor"
-        )
-
-        pct_col = (
-            f"{metric}_pct"
-        )
-
-        lower_is_better = (
-            metric
-            in
-            LOWER_IS_BETTER
-        )
-
-        current[
-            pct_col
-        ] = (
-            current
-            .groupby(
-                "sector"
-            )[
-                winsor_col
-            ]
-            .rank(
-                pct=True,
-                ascending=(
-                    False
-                    if lower_is_better
-                    else True
-                ),
-                method="average",
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # Três fatores
-    # ------------------------------------------------------------------
-
-    for (
-        factor_name,
-        definition,
-    ) in FACTOR_DEFINITIONS.items():
-
-        components = (
-            definition[
-                "higher"
-            ]
+        metrics = (
+            definition["higher"]
             +
-            definition[
-                "lower"
-            ]
+            definition["lower"]
         )
 
-        pct_columns = [
-            f"{metric}_pct"
-            for metric
-            in components
-        ]
+        components = pd.DataFrame(
+            index=sector_df.index
+        )
 
-        current[
-            f"{factor_name}_components_cell28"
-        ] = (
-            current[
-                pct_columns
-            ]
-            .notna()
-            .sum(
-                axis=1
+        for metric in metrics:
+
+            if metric not in sector_df.columns:
+                sector_df[metric] = np.nan
+
+            winsor = winsorize_reference(
+                sector_df[metric]
             )
+
+            lower_is_better = (
+                metric
+                in
+                definition["lower"]
+            )
+
+            components[metric] = (
+                winsor.rank(
+                    pct=True,
+                    ascending=not lower_is_better,
+                    method="average",
+                )
+            )
+
+        sector_df[
+            "reference_components"
+        ] = (
+            components
+            .notna()
+            .sum(axis=1)
         )
 
-        # CÉLULA 28 = MÉDIA, não mediana.
-        current[
-            f"{factor_name}_score_cell28"
+        sector_df[
+            "reference_score"
         ] = (
-            current[
-                pct_columns
-            ]
+            components
             .mean(
                 axis=1,
                 skipna=True,
             )
         )
 
-        current.loc[
-            (
-                current[
-                    f"{factor_name}_components_cell28"
-                ]
-                <
-                MIN_FACTOR_COMPONENTS[
-                    factor_name
-                ]
-            ),
-            f"{factor_name}_score_cell28",
+        sector_df.loc[
+            sector_df["reference_components"]
+            <
+            definition["minimum_components"],
+            "reference_score",
         ] = np.nan
 
-    current[
-        "factor_used_cell28"
-    ] = (
-        current[
-            "sector"
-        ]
-        .map(
-            {
-                "Health Care":
-                    "financial_strength_score_cell28",
-
-                "Industrials":
-                    "growth_score_cell28",
-
-                "Information Technology":
-                    "quality_score_cell28",
-            }
-        )
-    )
-
-    def selected_score(
-        row,
-    ):
-
-        factor_col = (
-            row[
-                "factor_used_cell28"
-            ]
-        )
-
-        if (
-            factor_col
-            not in
-            row.index
-        ):
-
-            return np.nan
-
-        return row[
-            factor_col
-        ]
-
-    current[
-        "selected_score_cell28"
-    ] = (
-        current
-        .apply(
-            selected_score,
-            axis=1,
-        )
-    )
-
-    current[
-        "selection_eligible_cell28"
-    ] = (
-        current[
-            "selected_score_cell28"
-        ]
-        .notna()
-    )
-
-    # Se o snapshot atual já contém ranking_eligible,
-    # a Célula 28 também exigia esse filtro.
-    if (
-        "ranking_eligible"
-        in
-        current.columns
-    ):
-
-        current[
-            "selection_eligible_cell28"
-        ] = (
-            current[
-                "selection_eligible_cell28"
-            ]
-            &
-            current[
-                "ranking_eligible"
-            ]
-            .fillna(
-                False
-            )
-            .astype(
-                bool
-            )
-        )
-
-    eligible = (
-        current[
-            current[
-                "selection_eligible_cell28"
-            ]
-        ]
-        .copy()
-    )
-
-    eligible = (
-        eligible
-        .sort_values(
-            [
-                "sector",
-                "selected_score_cell28",
-                "ticker",
-            ],
-            ascending=[
-                True,
-                False,
-                True,
-            ],
-        )
-        .reset_index(
-            drop=True
-        )
-    )
-
-    # Célula 28 usava rank(method="first").
-    eligible[
-        "sector_rank_cell28"
-    ] = (
-        eligible
-        .groupby(
-            "sector"
-        )[
-            "selected_score_cell28"
-        ]
-        .rank(
-            ascending=False,
-            method="first",
-        )
-        .astype(
-            int
-        )
-    )
-
-    return eligible
-
-
-# ======================================================================================
-# 4. RANKING DA IMPLEMENTAÇÃO ATUAL DO GITHUB
-# ======================================================================================
-
-def build_github_full_ranking(
-    snapshot: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Abre score_sector() do selection.py para todo o universo,
-    antes da regra de fronteira.
-    """
-
-    base = (
-        build_derived_metrics(
-            snapshot
-        )
-    )
-
-    base = (
-        ensure_growth_metrics(
-            base
-        )
-    )
-
-    parts = []
-
-    for sector in TARGET_SECTORS:
+        sector_df[
+            "reference_factor"
+        ] = factor
 
         sector_df = (
-            base[
-                base[
-                    "sector"
-                ]
-                ==
-                sector
-            ]
-            .copy()
-        )
-
-        scored, score_col = (
-            score_sector(
-                sector_df,
-                sector,
-            )
-        )
-
-        scored[
-            "github_score_column"
-        ] = score_col
-
-        scored[
-            "selected_score_github"
-        ] = (
-            scored[
-                score_col
-            ]
-        )
-
-        scored = (
-            scored[
-                scored[
-                    "selected_score_github"
+            sector_df[
+                sector_df[
+                    "reference_score"
                 ]
                 .notna()
             ]
             .sort_values(
                 [
-                    "selected_score_github",
+                    "reference_score",
                     "ticker",
                 ],
                 ascending=[
@@ -723,33 +259,107 @@ def build_github_full_ranking(
                     True,
                 ],
             )
-            .reset_index(
-                drop=True
+            .reset_index(drop=True)
+        )
+
+        sector_df[
+            "reference_rank"
+        ] = np.arange(
+            1,
+            len(sector_df) + 1,
+        )
+
+        parts.append(
+            sector_df
+        )
+
+    return pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+
+# ======================================================================================
+# 4. RANKING ATUAL DO GITHUB
+# ======================================================================================
+
+def build_github_ranking(
+    snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+
+    base = build_derived_metrics(
+        snapshot
+    )
+
+    base["ticker"] = (
+        base["ticker"]
+        .map(normalize_ticker)
+    )
+
+    parts = []
+
+    for sector in SECTORS:
+
+        sector_df = (
+            base[
+                base["sector"] == sector
+            ]
+            .copy()
+        )
+
+        scored, score_column = (
+            score_sector(
+                sector_df,
+                sector,
             )
         )
 
         scored[
-            "sector_rank_github"
-        ] = (
-            np.arange(
-                1,
-                len(
-                    scored
-                )
-                +
-                1,
+            "github_factor"
+        ] = SELECTION_FACTORS[
+            sector
+        ]
+
+        scored[
+            "github_score"
+        ] = scored[
+            score_column
+        ]
+
+        scored = (
+            scored[
+                scored[
+                    "github_score"
+                ]
+                .notna()
+            ]
+            .sort_values(
+                [
+                    "github_score",
+                    "ticker",
+                ],
+                ascending=[
+                    False,
+                    True,
+                ],
             )
+            .reset_index(drop=True)
+        )
+
+        scored[
+            "github_rank"
+        ] = np.arange(
+            1,
+            len(scored) + 1,
         )
 
         parts.append(
             scored
         )
 
-    return (
-        pd.concat(
-            parts,
-            ignore_index=True,
-        )
+    return pd.concat(
+        parts,
+        ignore_index=True,
     )
 
 
@@ -757,35 +367,34 @@ def build_github_full_ranking(
 # 5. COMPARAÇÃO
 # ======================================================================================
 
-def build_comparison(
+def compare_rankings(
     reference: pd.DataFrame,
     github: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    ref_cols = [
-        "sector",
-        "ticker",
-        "factor_used_cell28",
-        "selected_score_cell28",
-        "sector_rank_cell28",
-    ]
+    ref = reference[
+        [
+            "sector",
+            "ticker",
+            "reference_factor",
+            "reference_score",
+            "reference_rank",
+        ]
+    ].copy()
 
-    gh_cols = [
-        "sector",
-        "ticker",
-        "github_score_column",
-        "selected_score_github",
-        "sector_rank_github",
-    ]
+    gh = github[
+        [
+            "sector",
+            "ticker",
+            "github_factor",
+            "github_score",
+            "github_rank",
+        ]
+    ].copy()
 
     comparison = (
-        reference[
-            ref_cols
-        ]
-        .merge(
-            github[
-                gh_cols
-            ],
+        ref.merge(
+            gh,
             on=[
                 "sector",
                 "ticker",
@@ -798,11 +407,11 @@ def build_comparison(
         "score_diff"
     ] = (
         comparison[
-            "selected_score_github"
+            "github_score"
         ]
         -
         comparison[
-            "selected_score_cell28"
+            "reference_score"
         ]
     )
 
@@ -810,63 +419,71 @@ def build_comparison(
         "rank_diff"
     ] = (
         comparison[
-            "sector_rank_github"
+            "github_rank"
         ]
         -
         comparison[
-            "sector_rank_cell28"
+            "reference_rank"
         ]
     )
 
     comparison[
-        "top5_cell28"
+        "top5_reference"
     ] = (
         comparison[
-            "sector_rank_cell28"
-        ]
-        <=
-        N_PER_SECTOR
-    )
-
-    comparison[
-        "top5_github_raw"
-    ] = (
-        comparison[
-            "sector_rank_github"
+            "reference_rank"
         ]
         <=
-        N_PER_SECTOR
+        5
     )
 
     comparison[
-        "same_top5_status"
+        "top5_github"
     ] = (
         comparison[
-            "top5_cell28"
+            "github_rank"
+        ]
+        <=
+        5
+    )
+
+    comparison[
+        "top5_same"
+    ] = (
+        comparison[
+            "top5_reference"
         ]
         ==
         comparison[
-            "top5_github_raw"
+            "top5_github"
         ]
     )
 
-    comparison = (
+    comparison[
+        "factor_same"
+    ] = (
+        comparison[
+            "reference_factor"
+        ]
+        ==
+        comparison[
+            "github_factor"
+        ]
+    )
+
+    return (
         comparison
         .sort_values(
             [
                 "sector",
-                "sector_rank_cell28",
-                "sector_rank_github",
+                "reference_rank",
+                "github_rank",
                 "ticker",
             ],
             na_position="last",
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
-
-    return comparison
 
 
 # ======================================================================================
@@ -876,7 +493,7 @@ def build_comparison(
 def run_audit():
 
     header(
-        "AUDITORIA DA SELEÇÃO — CÉLULA 28 x GITHUB"
+        "AUDITORIA DA SELEÇÃO — ESTUDO x GITHUB"
     )
 
     print(
@@ -885,37 +502,62 @@ def run_audit():
     )
 
     print(
-        "Referência metodológica         : "
-        "Célula 28"
+        "Regra esperada                 : "
+        "FS / GROWTH / FS"
     )
 
-    print(
-        "Auditoria de fronteira          : "
-        "Célula 29 / GitHub"
+    # ------------------------------------------------------------------
+    # CONFIG
+    # ------------------------------------------------------------------
+
+    header(
+        "1. CONFIGURAÇÃO"
     )
+
+    config_ok = True
+
+    for sector in SECTORS:
+
+        actual = SELECTION_FACTORS.get(
+            sector
+        )
+
+        expected = EXPECTED_FACTORS[
+            sector
+        ]
+
+        ok = (
+            actual
+            ==
+            expected
+        )
+
+        config_ok = (
+            config_ok
+            and
+            ok
+        )
+
+        print(
+            f"{sector:<31}: "
+            f"{actual:<20} "
+            f"{'OK' if ok else 'DIVERGENTE'}"
+        )
 
     # ------------------------------------------------------------------
     # UNIVERSO
     # ------------------------------------------------------------------
 
     header(
-        "1. UNIVERSO"
+        "2. UNIVERSO"
     )
 
-    universe = (
-        build_base_universe()
+    universe = build_base_universe()
+    universe = enrich_sectors(
+        universe
     )
-
-    universe = (
-        enrich_sectors(
-            universe
-        )
-    )
-
-    universe = (
-        filter_target_sectors(
-            universe
-        )
+    universe = filter_target_sectors(
+        universe
     )
 
     print(
@@ -924,13 +566,11 @@ def run_audit():
     )
 
     counts = (
-        universe[
-            "sector"
-        ]
+        universe["sector"]
         .value_counts()
     )
 
-    for sector in TARGET_SECTORS:
+    for sector in SECTORS:
 
         print(
             f"{sector:<31}: "
@@ -942,7 +582,7 @@ def run_audit():
     # ------------------------------------------------------------------
 
     header(
-        "2. FUNDAMENTOS SEC"
+        "3. FUNDAMENTOS SEC"
     )
 
     fundamentals, errors = (
@@ -953,7 +593,7 @@ def run_audit():
     )
 
     print(
-        f"\nObservações fundamentais        : "
+        f"\nObservações fundamentais       : "
         f"{len(fundamentals):,}"
     )
 
@@ -961,9 +601,8 @@ def run_audit():
         errors,
         pd.DataFrame,
     ):
-
         print(
-            f"Empresas com erro               : "
+            f"Empresas com erro              : "
             f"{len(errors):,}"
         )
 
@@ -972,7 +611,7 @@ def run_audit():
     # ------------------------------------------------------------------
 
     header(
-        "3. SNAPSHOT FUNDAMENTAL"
+        "4. SNAPSHOT"
     )
 
     snapshot = (
@@ -995,80 +634,65 @@ def run_audit():
     )
 
     print(
-        f"\nEmpresas no snapshot            : "
+        f"\nEmpresas no snapshot           : "
         f"{len(snapshot):,}"
     )
 
     # ------------------------------------------------------------------
-    # CÉLULA 28
+    # RANKINGS
     # ------------------------------------------------------------------
 
     header(
-        "4. REPRODUÇÃO INDEPENDENTE DA CÉLULA 28"
+        "5. RANKING DE REFERÊNCIA DO ESTUDO"
     )
 
-    cell28 = (
-        reproduce_cell28(
+    reference = (
+        build_reference_ranking(
             snapshot
         )
     )
 
-    for sector in TARGET_SECTORS:
+    for sector in SECTORS:
 
         temp = (
-            cell28[
-                cell28[
+            reference[
+                reference[
                     "sector"
                 ]
                 ==
                 sector
             ]
-            .sort_values(
-                "sector_rank_cell28"
-            )
-            .head(
-                10
-            )
+            .head(10)
         )
 
         print(
-            "\n"
-            +
-            sector.upper()
+            f"\n{sector.upper()}"
         )
 
         print(
             temp[
                 [
-                    "sector_rank_cell28",
+                    "reference_rank",
                     "ticker",
-                    "factor_used_cell28",
-                    "selected_score_cell28",
+                    "reference_factor",
+                    "reference_score",
                 ]
             ]
-            .round(
-                6
-            )
-            .to_string(
-                index=False
-            )
+            .round(6)
+            .to_string(index=False)
         )
 
-    # ------------------------------------------------------------------
-    # GITHUB RAW
-    # ------------------------------------------------------------------
-
     header(
-        "5. RANKING BRUTO DO selection.py"
+        "6. RANKING ATUAL DO GITHUB"
     )
 
     github = (
-        build_github_full_ranking(
+        build_github_ranking(
             snapshot
         )
     )
 
-    for sector in TARGET_SECTORS:
+    for sector in SECTORS:
 
         temp = (
             github[
@@ -1078,35 +702,24 @@ def run_audit():
                 ==
                 sector
             ]
-            .sort_values(
-                "sector_rank_github"
-            )
-            .head(
-                10
-            )
+            .head(10)
         )
 
         print(
-            "\n"
-            +
-            sector.upper()
+            f"\n{sector.upper()}"
         )
 
         print(
             temp[
                 [
-                    "sector_rank_github",
+                    "github_rank",
                     "ticker",
-                    "github_score_column",
-                    "selected_score_github",
+                    "github_factor",
+                    "github_score",
                 ]
             ]
-            .round(
-                6
-            )
-            .to_string(
-                index=False
-            )
+            .round(6)
+            .to_string(index=False)
         )
 
     # ------------------------------------------------------------------
@@ -1114,21 +727,19 @@ def run_audit():
     # ------------------------------------------------------------------
 
     header(
-        "6. COMPARAÇÃO — CÉLULA 28 x GITHUB"
+        "7. COMPARAÇÃO NUMÉRICA"
     )
 
-    comparison = (
-        build_comparison(
-            cell28,
-            github,
-        )
+    comparison = compare_rankings(
+        reference,
+        github,
     )
 
     boundary = (
         comparison[
             (
                 comparison[
-                    "sector_rank_cell28"
+                    "reference_rank"
                 ]
                 <=
                 7
@@ -1136,7 +747,7 @@ def run_audit():
             |
             (
                 comparison[
-                    "sector_rank_github"
+                    "github_rank"
                 ]
                 <=
                 7
@@ -1150,300 +761,151 @@ def run_audit():
             [
                 "sector",
                 "ticker",
-                "selected_score_cell28",
-                "selected_score_github",
+                "reference_score",
+                "github_score",
                 "score_diff",
-                "sector_rank_cell28",
-                "sector_rank_github",
+                "reference_rank",
+                "github_rank",
                 "rank_diff",
-                "top5_cell28",
-                "top5_github_raw",
-                "same_top5_status",
+                "top5_reference",
+                "top5_github",
+                "top5_same",
+                "factor_same",
             ]
         ]
-        .round(
-            6
-        )
-        .to_string(
-            index=False
-        )
+        .round(6)
+        .to_string(index=False)
     )
 
     # ------------------------------------------------------------------
-    # TOP 5 PURO DA CÉLULA 28
+    # TOP 5
     # ------------------------------------------------------------------
 
     header(
-        "7. TOP 5 — CÉLULA 28"
+        "8. TOP 5 POR SETOR"
     )
 
-    cell28_top5 = (
-        cell28[
-            cell28[
-                "sector_rank_cell28"
-            ]
-            <=
-            N_PER_SECTOR
-        ]
-        .copy()
-    )
+    all_top5_ok = True
 
-    for sector in TARGET_SECTORS:
+    for sector in SECTORS:
 
-        tickers = (
-            cell28_top5[
-                cell28_top5[
-                    "sector"
-                ]
-                ==
-                sector
-            ]
-            .sort_values(
-                "sector_rank_cell28"
-            )[
-                "ticker"
-            ]
-            .tolist()
-        )
-
-        print(
-            f"{sector:<31}: "
-            +
-            ", ".join(
-                tickers
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # TOP 5 DO GITHUB SEM FRONTEIRA
-    # ------------------------------------------------------------------
-
-    header(
-        "8. TOP 5 — GITHUB BRUTO / SEM FRONTEIRA"
-    )
-
-    github_top5 = (
-        github[
-            github[
-                "sector_rank_github"
-            ]
-            <=
-            N_PER_SECTOR
-        ]
-        .copy()
-    )
-
-    for sector in TARGET_SECTORS:
-
-        tickers = (
-            github_top5[
-                github_top5[
-                    "sector"
-                ]
-                ==
-                sector
-            ]
-            .sort_values(
-                "sector_rank_github"
-            )[
-                "ticker"
-            ]
-            .tolist()
-        )
-
-        print(
-            f"{sector:<31}: "
-            +
-            ", ".join(
-                tickers
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # CARTEIRA OPERACIONAL COM FRONTEIRA
-    # ------------------------------------------------------------------
-
-    header(
-        "9. CARTEIRA OPERACIONAL DO GITHUB — COM REGRA DE FRONTEIRA"
-    )
-
-    operational = (
-        select_portfolio(
-            universe=snapshot,
-            use_previous_portfolio=True,
-        )
-    )
-
-    for sector in TARGET_SECTORS:
-
-        temp = (
-            operational[
-                operational[
-                    "sector"
-                ]
-                ==
-                sector
-            ]
-            .sort_values(
-                "selection_rank"
-            )
-        )
-
-        print(
-            f"{sector:<31}: "
-            +
-            ", ".join(
-                temp[
-                    "ticker"
-                ]
-                .astype(
-                    str
+        ref_top5 = (
+            reference[
+                (
+                    reference["sector"]
+                    ==
+                    sector
                 )
-                .tolist()
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # FRONTEIRA
-    # ------------------------------------------------------------------
-
-    header(
-        "10. AUDITORIA DA FRONTEIRA"
-    )
-
-    frontier = (
-        build_frontier_audit(
-            snapshot
-        )
-    )
-
-    if frontier.empty:
-
-        print(
-            "\nSem auditoria de fronteira disponível."
-        )
-
-    else:
-
-        print(
-            frontier.to_string(
-                index=False
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # DIAGNÓSTICO
-    # ------------------------------------------------------------------
-
-    header(
-        "11. DIAGNÓSTICO FINAL"
-    )
-
-    top5_match_by_sector = {}
-
-    for sector in TARGET_SECTORS:
-
-        ref = set(
-            cell28_top5.loc[
-                cell28_top5[
-                    "sector"
-                ]
-                ==
-                sector,
-                "ticker",
+                &
+                (
+                    reference["reference_rank"]
+                    <=
+                    5
+                )
             ]
+            .sort_values(
+                "reference_rank"
+            )["ticker"]
+            .tolist()
         )
 
-        gh = set(
-            github_top5.loc[
-                github_top5[
-                    "sector"
-                ]
-                ==
-                sector,
-                "ticker",
+        gh_top5 = (
+            github[
+                (
+                    github["sector"]
+                    ==
+                    sector
+                )
+                &
+                (
+                    github["github_rank"]
+                    <=
+                    5
+                )
             ]
+            .sort_values(
+                "github_rank"
+            )["ticker"]
+            .tolist()
         )
 
-        top5_match_by_sector[
-            sector
-        ] = (
-            ref
+        same = (
+            ref_top5
             ==
-            gh
+            gh_top5
+        )
+
+        all_top5_ok = (
+            all_top5_ok
+            and
+            same
         )
 
         print(
-            f"{sector:<31}: "
-            f"{'TOP 5 IDÊNTICO' if ref == gh else 'DIVERGENTE'}"
+            f"\n{sector}"
         )
 
-    all_top5_match = all(
-        top5_match_by_sector.values()
+        print(
+            "  Estudo : "
+            +
+            ", ".join(
+                ref_top5
+            )
+        )
+
+        print(
+            "  GitHub : "
+            +
+            ", ".join(
+                gh_top5
+            )
+        )
+
+        print(
+            "  Status : "
+            +
+            (
+                "IDÊNTICO"
+                if same
+                else
+                "DIVERGENTE"
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # DIAGNÓSTICO FINAL
+    # ------------------------------------------------------------------
+
+    header(
+        "9. DIAGNÓSTICO FINAL"
     )
 
-    # Quantas empresas que aparecem em pelo menos um Top 5
-    # estão com o mesmo status.
-    top5_union = (
+    common = (
         comparison[
             comparison[
-                "top5_cell28"
-            ]
-            |
-            comparison[
-                "top5_github_raw"
-            ]
-        ]
-    )
-
-    same_status = int(
-        top5_union[
-            "same_top5_status"
-        ]
-        .sum()
-    )
-
-    total_status = len(
-        top5_union
-    )
-
-    print(
-        f"\nStatus Top 5 coincidentes        : "
-        f"{same_status}/{total_status}"
-    )
-
-    print(
-        f"Top 5 idêntico nos 3 setores    : "
-        f"{all_top5_match}"
-    )
-
-    # Diferenças de score entre os mesmos tickers.
-    common_scores = (
-        comparison[
-            comparison[
-                "selected_score_cell28"
+                "reference_score"
             ]
             .notna()
             &
             comparison[
-                "selected_score_github"
+                "github_score"
             ]
             .notna()
         ]
     )
 
-    if not common_scores.empty:
+    if not common.empty:
 
-        mean_abs_score_diff = float(
-            common_scores[
+        mean_abs_diff = float(
+            common[
                 "score_diff"
             ]
             .abs()
             .mean()
         )
 
-        max_abs_score_diff = float(
-            common_scores[
+        max_abs_diff = float(
+            common[
                 "score_diff"
             ]
             .abs()
@@ -1452,35 +914,96 @@ def run_audit():
 
     else:
 
-        mean_abs_score_diff = np.nan
-        max_abs_score_diff = np.nan
+        mean_abs_diff = np.nan
+        max_abs_diff = np.nan
+
+    all_factor_ok = bool(
+        comparison[
+            comparison[
+                "reference_factor"
+            ]
+            .notna()
+            &
+            comparison[
+                "github_factor"
+            ]
+            .notna()
+        ][
+            "factor_same"
+        ]
+        .all()
+    )
 
     print(
-        f"Diferença média absoluta score  : "
-        f"{mean_abs_score_diff:.6f}"
+        f"\nConfiguração FS/Growth/FS        : "
+        f"{config_ok}"
+    )
+
+    print(
+        f"Fatores iguais                   : "
+        f"{all_factor_ok}"
+    )
+
+    print(
+        f"Top 5 idêntico nos 3 setores     : "
+        f"{all_top5_ok}"
+    )
+
+    print(
+        f"Diferença média absoluta score   : "
+        f"{mean_abs_diff:.10f}"
     )
 
     print(
         f"Diferença máxima absoluta score  : "
-        f"{max_abs_score_diff:.6f}"
+        f"{max_abs_diff:.10f}"
     )
 
-    if all_top5_match:
+    if (
+        config_ok
+        and
+        all_factor_ok
+        and
+        all_top5_ok
+        and
+        (
+            pd.isna(max_abs_diff)
+            or
+            max_abs_diff
+            <
+            1e-10
+        )
+    ):
 
         status = (
-            "APROVADA NO TOP 5 — "
-            "VERIFICAR TAMBÉM FIDELIDADE NUMÉRICA DOS SCORES"
+            "AUDITORIA APROVADA — "
+            "SELEÇÃO DO GITHUB REPRODUZ A REGRA VENCEDORA DO ESTUDO."
+        )
+
+    elif (
+        config_ok
+        and
+        all_factor_ok
+        and
+        all_top5_ok
+    ):
+
+        status = (
+            "TOP 5 APROVADO — "
+            "EXISTEM DIFERENÇAS NUMÉRICAS A AUDITAR."
         )
 
     else:
 
         status = (
-            "DIVERGÊNCIA DETECTADA — "
-            "selection.py NÃO REPRODUZ INTEGRALMENTE A CÉLULA 28"
+            "AUDITORIA NÃO APROVADA — "
+            "EXISTEM DIVERGÊNCIAS NA SELEÇÃO."
         )
 
     print(
-        f"\nSTATUS: {status}"
+        "\nSTATUS: "
+        +
+        status
     )
 
     # ------------------------------------------------------------------
@@ -1492,48 +1015,38 @@ def run_audit():
         index=False,
     )
 
-    cell28.to_csv(
-        OUTPUT_REFERENCE_RANKING,
+    reference.to_csv(
+        OUTPUT_REFERENCE,
         index=False,
     )
 
     github.to_csv(
-        OUTPUT_GITHUB_RANKING,
-        index=False,
-    )
-
-    frontier.to_csv(
-        OUTPUT_FRONTIER,
+        OUTPUT_GITHUB,
         index=False,
     )
 
     header(
-        "12. ARQUIVOS"
+        "10. ARQUIVOS"
     )
 
     print(
-        f"\nComparação      : "
+        f"\nComparação : "
         f"{OUTPUT_COMPARISON}"
     )
 
     print(
-        f"Ranking Célula28: "
-        f"{OUTPUT_REFERENCE_RANKING}"
+        f"Referência : "
+        f"{OUTPUT_REFERENCE}"
     )
 
     print(
-        f"Ranking GitHub  : "
-        f"{OUTPUT_GITHUB_RANKING}"
-    )
-
-    print(
-        f"Fronteira       : "
-        f"{OUTPUT_FRONTIER}"
+        f"GitHub     : "
+        f"{OUTPUT_GITHUB}"
     )
 
 
 # ======================================================================================
-# 7. EXECUÇÃO
+# 7. EXECUÇÃO DIRETA
 # ======================================================================================
 
 if __name__ == "__main__":
