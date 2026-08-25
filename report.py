@@ -1030,6 +1030,127 @@ def build_sector_table(
     return table
 
 
+
+# ======================================================================================
+# 11B. EXPLICAÇÃO INDIVIDUAL DAS AÇÕES
+# ======================================================================================
+
+def build_stock_explanation(
+    row: pd.Series,
+    styles,
+):
+    """
+    Traduz os resultados já calculados pelo motor em linguagem simples.
+    Não recalcula nem altera nenhum sinal.
+    """
+
+    ticker = safe_text(
+        row.get(
+            "ticker"
+        )
+    )
+
+    sector = safe_text(
+        row.get(
+            "sector"
+        )
+    )
+
+    signal = safe_text(
+        row.get(
+            "entry_signal"
+        )
+    )
+
+    valuation = safe_text(
+        row.get(
+            "valuation_status"
+        )
+    )
+
+    discount = safe_text(
+        row.get(
+            "discount_status"
+        )
+    )
+
+    fundamentals = safe_text(
+        row.get(
+            "fundamental_status"
+        )
+    )
+
+    selection_score = format_score(
+        row.get(
+            "selection_score"
+        )
+    )
+
+    final_score = format_score(
+        row.get(
+            "final_signal_score"
+        )
+    )
+
+    percentile = format_pct(
+        row.get(
+            "signal_percentile"
+        )
+    )
+
+    if signal == "ENTRADA FORTE":
+
+        interpretation = (
+            "O ponto de entrada é excepcional dentro das regras "
+            "históricas do modelo e recebe a maior prioridade operacional."
+        )
+
+    elif signal == "ENTRADA":
+
+        interpretation = (
+            "O ponto de entrada é favorável e foi aprovado "
+            "pelos critérios quantitativos do setor."
+        )
+
+    elif signal == "AGUARDAR":
+
+        interpretation = (
+            "A empresa continua entre as 15 selecionadas, mas o timing "
+            "atual ainda não apresenta vantagem suficiente para nova compra."
+        )
+
+    elif signal == "NÃO COMPRAR AGORA":
+
+        interpretation = (
+            "A empresa permanece estruturalmente selecionada, porém o modelo "
+            "não recomenda nova compra no momento."
+        )
+
+    else:
+
+        interpretation = (
+            "O motor não apresentou uma classificação operacional completa."
+        )
+
+    text = (
+        f"<b>{ticker}</b> — {sector}<br/>"
+        f"<b>Sinal:</b> {signal}. {interpretation}<br/>"
+        f"<b>Seleção:</b> score {selection_score}. "
+        f"<b>Valuation:</b> {valuation}. "
+        f"<b>Desconto:</b> {discount}. "
+        f"<b>Fundamentos:</b> {fundamentals}. "
+        f"<b>Score final:</b> {final_score}. "
+        f"<b>Percentil:</b> {percentile}."
+    )
+
+    return Paragraph(
+        text,
+        styles[
+            "body"
+        ],
+    )
+
+
 # ======================================================================================
 # 12. GERAR PDF
 # ======================================================================================
@@ -1149,7 +1270,7 @@ def generate_pdf(
         "10% Valuation + 80% Desconto + 10% Fundamentos.<br/>"
         "<b>Industrials:</b> Growth → "
         "20% Desconto + 80% Fundamentos — CONDICIONAL.<br/>"
-        "<b>Information Technology:</b> Quality → "
+        "<b>Information Technology:</b> Financial Strength → "
         "Momentum 6M + 12M.<br/><br/>"
         "Estrutura fixa: 3 setores, 5 ações por setor, "
         "15 ações totais. Os tickers podem mudar conforme "
@@ -1255,7 +1376,7 @@ def generate_pdf(
         else:
 
             description = (
-                "Critério de seleção: Quality. "
+                "Critério de seleção: Financial Strength. "
                 "Timing: Momentum combinado de 6 e 12 meses."
             )
 
@@ -1290,6 +1411,64 @@ def generate_pdf(
                     8 * mm,
                 )
             )
+
+    # ------------------------------------------------------------------
+    # EXPLICAÇÃO AÇÃO POR AÇÃO
+    # ------------------------------------------------------------------
+
+    story.append(
+        PageBreak()
+    )
+
+    story.append(
+        Paragraph(
+            "Explicação individual das 15 ações",
+            styles[
+                "heading"
+            ],
+        )
+    )
+
+    story.append(
+        Paragraph(
+            (
+                "Esta seção apenas traduz os resultados já produzidos pelo motor. "
+                "Ela não cria novos critérios e não altera os sinais."
+            ),
+            styles[
+                "small"
+            ],
+        )
+    )
+
+    story.append(
+        Spacer(
+            1,
+            4 * mm,
+        )
+    )
+
+    explained = (
+        order_for_report(
+            ranking
+        )
+    )
+
+    for _, row in explained.iterrows():
+
+        story.append(
+            build_stock_explanation(
+                row,
+                styles,
+            )
+        )
+
+        story.append(
+            Spacer(
+                1,
+                4 * mm,
+            )
+        )
 
     # ------------------------------------------------------------------
     # OBSERVAÇÃO
