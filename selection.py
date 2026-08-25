@@ -27,11 +27,10 @@
 #      operating_cash_flow_growth ↑
 #
 # Information Technology
-#   -> Quality
-#      roa ↑
-#      roe ↑
-#      operating_margin ↑
-#      net_margin ↑
+#   -> Financial Strength
+#      cash_assets ↑
+#      debt_assets ↓
+#      debt_equity ↓
 #
 # METODOLOGIA
 # -----------
@@ -42,7 +41,6 @@
 #   5) mínimo de componentes:
 #          Financial Strength = 2/3
 #          Growth             = 2/3
-#          Quality            = 3/4
 #   6) ranking
 #   7) Top 5 por setor
 #   8) proteção de fronteira 5º vs 6º
@@ -60,10 +58,53 @@ import pandas as pd
 from config import (
     SECTORS,
     SECTOR_TARGETS,
-    SELECTION_FACTORS,
+    SELECTION_FACTORS as CONFIG_SELECTION_FACTORS,
     FRONTIER_MIN_RELATIVE_GAP,
     CURRENT_PORTFOLIO_FILE,
 )
+
+
+# ======================================================================================
+# REGRA VENCEDORA DO ESTUDO — CÉLULAS 15, 16 E 17
+# ======================================================================================
+#
+# A seleção operacional NÃO depende mais de uma configuração divergente em config.py.
+# Esta regra é congelada aqui porque foi a estratégia setorial historicamente validada:
+#
+#   Health Care              -> Financial Strength
+#   Industrials              -> Growth
+#   Information Technology   -> Financial Strength
+#
+# Quality permanece implementado apenas para compatibilidade/auditoria, mas NÃO é fator
+# vencedor de Information Technology.
+# ======================================================================================
+
+STUDY_SELECTION_FACTORS = {
+    "Health Care": "financial_strength",
+    "Industrials": "growth",
+    "Information Technology": "financial_strength",
+}
+
+# Nome usado pelo restante deste módulo.
+SELECTION_FACTORS = STUDY_SELECTION_FACTORS.copy()
+
+
+def validate_selection_factor_alignment() -> None:
+    """
+    Detecta drift entre config.py e a regra vencedora do estudo.
+
+    Não permite que uma alteração futura em config.py mude silenciosamente a
+    metodologia validada das Células 15/16/17.
+    """
+
+    config_map = dict(CONFIG_SELECTION_FACTORS)
+
+    if config_map != STUDY_SELECTION_FACTORS:
+        print(
+            "ATENÇÃO: config.py diverge da regra vencedora do estudo. "
+            "selection.py usará STUDY_SELECTION_FACTORS = "
+            f"{STUDY_SELECTION_FACTORS}. Config recebido = {config_map}."
+        )
 
 
 # ======================================================================================
@@ -1133,6 +1174,8 @@ def select_portfolio(
     use_previous_portfolio: bool = True,
 ) -> pd.DataFrame:
 
+    validate_selection_factor_alignment()
+
     required_columns = {
         "ticker",
         "sector",
@@ -1405,7 +1448,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "\nFatores congelados:"
+        "\nFatores vencedores congelados (Células 15/16/17):"
     )
 
     for sector in SECTORS:
