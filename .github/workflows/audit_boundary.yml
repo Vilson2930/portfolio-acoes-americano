@@ -1,1 +1,42 @@
+name: Audit Boundary - Cell 31
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy requests yfinance lxml beautifulsoup4 pyarrow
+          fi
+
+      - name: Validate Python files
+        run: |
+          python -m py_compile config.py
+          python -m py_compile data.py
+          python -m py_compile selection.py
+          python -m py_compile main.py
+
+      - name: Run boundary validation
+        run: |
+          python main.py
