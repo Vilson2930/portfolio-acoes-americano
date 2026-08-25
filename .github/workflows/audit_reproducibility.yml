@@ -9,7 +9,7 @@ permissions:
 jobs:
   final-reproducibility-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -36,9 +36,10 @@ jobs:
 
       - name: Run final reproducibility audit
         env:
+          PYTHONUNBUFFERED: "1"
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
         run: |
-          python audit_reproducibility.py
+          python -u audit_reproducibility.py
 
       - name: Upload final audit artifacts
         if: always()
